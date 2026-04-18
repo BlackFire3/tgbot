@@ -347,6 +347,14 @@ def _labels(src: str, dst: str) -> tuple[str, str]:
     return label(src), label(dst)
 
 
+# ── Formatting ────────────────────────────────────────────────────────────────
+
+def fmt_amount(value: float) -> str:
+    """Round to max 4 decimal places, no scientific notation, no trailing zeros."""
+    rounded = round(value, 4)
+    return f"{rounded:.4f}".rstrip("0").rstrip(".")
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 VALID_CODES = {*CURRENCIES, "rub", "usd_d"}
@@ -546,11 +554,11 @@ async def on_amount(message: Message, state: FSMContext) -> None:
             await state.clear()
             return
         if src == "btc":
-            from_str = f"{amount:g} 🪙 BTC"
+            from_str = f"{fmt_amount(amount)} 🪙 BTC"
             to_str = f"${amount * rate:,.2f}".replace(",", " ")
         else:
             from_str = f"${amount:,.2f}".replace(",", " ")
-            to_str = f"{amount / rate:g} 🪙 BTC"
+            to_str = f"{fmt_amount(amount / rate)} 🪙 BTC"
         rate_str = f"1 BTC = ${rate:,.2f}".replace(",", " ")
         await message.answer(f"💱 *{from_str} = {to_str}*\n_{rate_str}_", parse_mode="Markdown")
         await state.clear()
@@ -575,10 +583,10 @@ async def on_amount(message: Message, state: FSMContext) -> None:
     if src == "rub":
         result_amount = amount / rate
         from_str = f"{amount:,.2f} ₽".replace(",", " ")
-        to_str = f"{result_amount:g} {emoji} {ticker}"
+        to_str = f"{fmt_amount(result_amount)} {emoji} {ticker}"
     else:
         result_amount = amount * rate
-        from_str = f"{amount:g} {emoji} {ticker}"
+        from_str = f"{fmt_amount(amount)} {emoji} {ticker}"
         to_str = f"{result_amount:,.2f} ₽".replace(",", " ")
 
     rate_str = f"1 {ticker} = {rate:,.2f} ₽".replace(",", " ")
