@@ -405,7 +405,7 @@ async def on_broadcast_start(message: Message, state: FSMContext) -> None:
     _, active = db_user_stats()
     await state.set_state(BroadcastStates.waiting_message)
     await message.answer(
-        f"✉️ Введи сообщение для рассылки.\n"
+        f"✉️ Введи текст для рассылки.\n"
         f"Получатели: *{active}* активных пользователей.\n\n"
         f"Для отмены — /cancel",
         parse_mode="Markdown",
@@ -425,7 +425,10 @@ async def on_cancel(message: Message, state: FSMContext) -> None:
 
 @dp.message(BroadcastStates.waiting_message)
 async def on_broadcast_message(message: Message, state: FSMContext, bot: Bot) -> None:
-    """Send the typed message to every active user."""
+    """Send text message to every active user."""
+    if not message.text:
+        await message.answer("⚠️ Поддерживается только текст. Введи текстовое сообщение:")
+        return
     await state.clear()
     user_ids = db_get_active_user_ids()
     sent = failed = blocked = 0
@@ -434,7 +437,7 @@ async def on_broadcast_message(message: Message, state: FSMContext, bot: Bot) ->
 
     for uid in user_ids:
         try:
-            await bot.send_message(uid, message.text or "")
+            await bot.send_message(uid, message.text)
             sent += 1
         except Exception as e:
             err = str(e).lower()
