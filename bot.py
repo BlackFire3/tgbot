@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import FuncFormatter
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -697,6 +697,13 @@ async def on_amount(message: Message, state: FSMContext) -> None:
     await message.answer(f"💱 *{from_str} = {to_str}*\n_{rate_str}_", parse_mode="Markdown")
     await state.clear()
     await message.answer("🔄 Ещё конвертация?", reply_markup=main_keyboard())
+
+
+@dp.message(StateFilter(None))
+async def on_unknown_message(message: Message) -> None:
+    """Любое сообщение вне FSM — показываем главное меню."""
+    _register(message)
+    await message.answer("Выбери направление конвертации:", reply_markup=main_keyboard())
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
