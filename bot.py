@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import FuncFormatter
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -23,6 +23,10 @@ from aiogram.types import (
 
 BOT_TOKEN = "BOT_TOKEN_HIDDEN"
 DB_PATH = Path(__file__).parent / "rates.db"
+
+# ── Admin settings ─────────────────────────────────────────────────────────────
+# Укажи сюда свой Telegram user_id (получить можно у @userinfobot)
+ADMIN_ID: int = 0  # TODO: замени на свой user_id
 
 CURRENCIES = {
     "btc": ("BTC", "🪙"),
@@ -41,6 +45,17 @@ def init_db() -> None:
                 currency TEXT NOT NULL,
                 rate     REAL NOT NULL,
                 PRIMARY KEY (date, currency)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id    INTEGER PRIMARY KEY,
+                username   TEXT,
+                first_name TEXT,
+                last_name  TEXT,
+                joined_at  TEXT NOT NULL,
+                last_seen  TEXT NOT NULL,
+                is_active  INTEGER NOT NULL DEFAULT 1
             )
         """)
 
@@ -72,11 +87,60 @@ def db_has_today(currency: str) -> bool:
     return count > 0
 
 
+# ── Users ─────────────────────────────────────────────────────────────────────
+
+def db_register_user(user_id: int, username: str | None,
+                     first_name: str | None, last_name: str | None) -> None:
+    """Upsert user record. Updates username/name and last_seen on every call."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO users (user_id, username, first_name, last_name, joined_at, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username   = excluded.username,
+                first_name = excluded.first_name,
+                last_name  = excluded.last_name,
+                last_seen  = excluded.last_seen,
+                is_active  = 1
+        """, (user_id, username, first_name, last_name, now, now))
+
+
+def db_mark_inactive(user_id: int) -> None:
+    """Called when bot is blocked — mark user as inactive so they skip broadcasts."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE users SET is_active = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+
+
+def db_get_active_user_ids() -> list[int]:
+    """Return all user_ids eligible for broadcast."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM users WHERE is_active = 1"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def db_user_stats() -> tuple[int, int]:
+    """Return (total_users, active_users)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        active = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE is_active = 1"
+        ).fetchone()[0]
+    return total, active
+
+
 # ── CBR fetch & save ──────────────────────────────────────────────────────────
 
 async def fetch_cbr_rates() -> dict[str, float]:
     async with aiohttp.ClientSession() as session:
-        async with session.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=15) as resp:
+        async with session.get(
+            "https://www.cbr-xml-daily.ru/daily_json.js", timeout=15
+        ) as resp:
             data = await resp.json(content_type=None)
     return {
         "usd": float(data["Valute"]["USD"]["Value"]),
@@ -156,7 +220,6 @@ async def get_weekly_rates(currency: str) -> list[tuple[datetime, float]]:
             ) as resp:
                 data = await resp.json()
         points = [(datetime.fromtimestamp(p[0] / 1000), p[1]) for p in data["prices"]]
-        # Replace last point with cached price so chart matches conversion rate
         current = _btc_price or (await _fetch_btc_price())
         if points:
             points[-1] = (points[-1][0], current)
@@ -171,8 +234,14 @@ async def get_weekly_rates(currency: str) -> list[tuple[datetime, float]]:
     return rows
 
 
+# ── FSM States ────────────────────────────────────────────────────────────────
+
 class ConvertStates(StatesGroup):
     waiting_amount = State()
+
+
+class BroadcastStates(StatesGroup):
+    waiting_message = State()
 
 
 # ── Chart ─────────────────────────────────────────────────────────────────────
@@ -240,16 +309,7 @@ def build_chart(currency: str, src: str, data: list[tuple[datetime, float]]) -> 
     return buf.read()
 
 
-# ── Bot handlers ──────────────────────────────────────────────────────────────
-
-dp = Dispatcher(storage=MemoryStorage())
-
-
-@dp.message(CommandStart())
-async def on_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer("👋 Привет! Выбери направление конвертации:", reply_markup=main_keyboard())
-
+# ── Keyboards ─────────────────────────────────────────────────────────────────
 
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -287,7 +347,98 @@ def _labels(src: str, dst: str) -> tuple[str, str]:
     return label(src), label(dst)
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
 VALID_CODES = {*CURRENCIES, "rub", "usd_d"}
+
+
+def _register(message: Message) -> None:
+    """Save/update user from any incoming message."""
+    u = message.from_user
+    if u:
+        db_register_user(u.id, u.username, u.first_name, u.last_name)
+
+
+# ── Bot handlers ──────────────────────────────────────────────────────────────
+
+dp = Dispatcher(storage=MemoryStorage())
+
+
+@dp.message(CommandStart())
+async def on_start(message: Message, state: FSMContext) -> None:
+    _register(message)
+    await state.clear()
+    await message.answer("👋 Привет! Выбери направление конвертации:", reply_markup=main_keyboard())
+
+
+@dp.message(Command("stats"))
+async def on_stats(message: Message) -> None:
+    """Admin: show user count."""
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    total, active = db_user_stats()
+    await message.answer(
+        f"📊 *Статистика пользователей*\n"
+        f"Всего: {total}\n"
+        f"Активных: {active}",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("broadcast"))
+async def on_broadcast_start(message: Message, state: FSMContext) -> None:
+    """Admin: start broadcast — next message will be sent to all active users."""
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    _, active = db_user_stats()
+    await state.set_state(BroadcastStates.waiting_message)
+    await message.answer(
+        f"✉️ Введи сообщение для рассылки.\n"
+        f"Получатели: *{active}* активных пользователей.\n\n"
+        f"Для отмены — /cancel",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("cancel"))
+async def on_cancel(message: Message, state: FSMContext) -> None:
+    current = await state.get_state()
+    if current == BroadcastStates.waiting_message:
+        await state.clear()
+        await message.answer("❌ Рассылка отменена.")
+    else:
+        await state.clear()
+        await message.answer("Главное меню:", reply_markup=main_keyboard())
+
+
+@dp.message(BroadcastStates.waiting_message)
+async def on_broadcast_message(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Send the typed message to every active user."""
+    await state.clear()
+    user_ids = db_get_active_user_ids()
+    sent = failed = blocked = 0
+
+    status_msg = await message.answer(f"⏳ Начинаю рассылку для {len(user_ids)} чел...")
+
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, message.text or "")
+            sent += 1
+        except Exception as e:
+            err = str(e).lower()
+            if "blocked" in err or "deactivated" in err or "not found" in err:
+                db_mark_inactive(uid)
+                blocked += 1
+            else:
+                failed += 1
+        await asyncio.sleep(0.05)  # Telegram rate limit
+
+    await status_msg.edit_text(
+        f"✅ Рассылка завершена\n"
+        f"Доставлено: {sent}\n"
+        f"Заблокировали бота: {blocked}\n"
+        f"Ошибки: {failed}"
+    )
 
 
 @dp.callback_query(F.data.startswith("conv:"))
@@ -354,6 +505,7 @@ async def on_chart(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(ConvertStates.waiting_amount)
 async def on_amount(message: Message, state: FSMContext) -> None:
+    _register(message)
     text = (message.text or "").replace(",", ".").strip()
     try:
         amount = float(text)
