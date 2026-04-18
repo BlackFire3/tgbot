@@ -3,6 +3,7 @@ import io
 import logging
 import os
 import sqlite3
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -36,6 +37,7 @@ CURRENCIES = {
     "btc": ("BTC", "🪙"),
     "usd": ("USD", "💵"),
     "eur": ("EUR", "💶"),
+    "kzt": ("KZT", "🇰🇿"),
 }
 
 
@@ -208,8 +210,46 @@ async def get_btc_usd_rate() -> float:
 
 
 async def get_rate_to_rub(currency: str) -> float:
+    if currency == "kzt":
+        return await _fetch_kzt_rate()
     rates = await fetch_cbr_rates()
     return rates[currency]
+
+
+# ── KZT — current rate & 7-day history from CBR XML API ──────────────────────
+
+async def _fetch_kzt_rate() -> float:
+    """Current KZT/RUB rate from CBR JSON (per 1 KZT)."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://www.cbr-xml-daily.ru/daily_json.js", timeout=15
+        ) as resp:
+            data = await resp.json(content_type=None)
+    valute = data["Valute"]["KZT"]
+    return float(valute["Value"]) / float(valute["Nominal"])
+
+
+async def _fetch_kzt_weekly() -> list[tuple[datetime, float]]:
+    """7-day KZT/RUB history from CBR dynamic XML API (R01335 = KZT, nominal 100)."""
+    end = datetime.now()
+    start = end - timedelta(days=10)   # запас на выходные
+    url = (
+        "https://www.cbr.ru/scripts/XML_dynamic.asp"
+        f"?date_req1={start.strftime('%d/%m/%Y')}"
+        f"&date_req2={end.strftime('%d/%m/%Y')}"
+        "&VAL_NM_RQ=R01335"
+    )
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=20) as resp:
+            text = await resp.text(encoding="windows-1251")
+    root = ET.fromstring(text)
+    points: list[tuple[datetime, float]] = []
+    for rec in root.findall("Record"):
+        dt = datetime.strptime(rec.get("Date"), "%d.%m.%Y")
+        value = float(rec.find("Value").text.replace(",", "."))
+        nominal = float(rec.find("Nominal").text)
+        points.append((dt, value / nominal))
+    return points[-7:]
 
 
 # ── Historical rates for chart ────────────────────────────────────────────────
@@ -227,6 +267,12 @@ async def get_weekly_rates(currency: str) -> list[tuple[datetime, float]]:
         current = _btc_price or (await _fetch_btc_price())
         if points:
             points[-1] = (points[-1][0], current)
+        return points
+
+    if currency == "kzt":
+        points = await _fetch_kzt_weekly()
+        if not points:
+            raise ValueError("Не удалось получить историю курса KZT. Попробуй позже.")
         return points
 
     rows = db_get_history(currency)
@@ -263,7 +309,7 @@ def build_chart(currency: str, src: str, data: list[tuple[datetime, float]]) -> 
     fig.patch.set_facecolor("#1a1a2e")
     ax.set_facecolor("#16213e")
 
-    color = "#f7931a" if is_btc else "#4cc9f0"
+    color = "#f7931a" if is_btc else ("#00c896" if currency == "kzt" else "#4cc9f0")
     ax.plot(dates, prices, color=color, linewidth=2.5, zorder=3)
     ax.fill_between(dates, prices, min(prices) * 0.998, alpha=0.25, color=color)
 
@@ -277,6 +323,10 @@ def build_chart(currency: str, src: str, data: list[tuple[datetime, float]]) -> 
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
         y_label = "Цена (USD)"
         last_label = f"${prices[-1]:,.0f}"
+    elif currency == "kzt":
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.4f} ₽"))
+        y_label = "Курс ЦБ РФ (₽)"
+        last_label = f"{prices[-1]:.4f} ₽"
     else:
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:,.2f} ₽"))
         y_label = "Курс ЦБ РФ (₽)"
@@ -327,6 +377,10 @@ def main_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="$ → 🪙 BTC", callback_data="conv:usd_d:btc"),
                 InlineKeyboardButton(text="₽ → 💵 USD", callback_data="conv:rub:usd"),
                 InlineKeyboardButton(text="₽ → 💶 EUR", callback_data="conv:rub:eur"),
+            ],
+            [
+                InlineKeyboardButton(text="🇰🇿 KZT → ₽", callback_data="conv:kzt:rub"),
+                InlineKeyboardButton(text="₽ → 🇰🇿 KZT", callback_data="conv:rub:kzt"),
             ],
         ]
     )
@@ -618,7 +672,7 @@ async def on_amount(message: Message, state: FSMContext) -> None:
         from_str = f"{fmt_amount(amount)} {emoji} {ticker}"
         to_str = f"{result_amount:,.2f} ₽".replace(",", " ")
 
-    rate_str = f"1 {ticker} = {rate:,.2f} ₽".replace(",", " ")
+    rate_str = f"1 {ticker} = {fmt_amount(rate)} ₽"
     await message.answer(f"💱 *{from_str} = {to_str}*\n_{rate_str}_", parse_mode="Markdown")
     await state.clear()
     await message.answer("🔄 Ещё конвертация?", reply_markup=main_keyboard())
