@@ -383,6 +383,28 @@ async def on_start(message: Message, state: FSMContext) -> None:
     await message.answer("👋 Привет! Выбери направление конвертации:", reply_markup=main_keyboard())
 
 
+@dp.message(Command("help"))
+async def on_help(message: Message) -> None:
+    if ADMIN_ID and message.from_user.id == ADMIN_ID:
+        await message.answer(
+            "📋 *Доступные команды*\n\n"
+            "👤 *Для всех:*\n"
+            "/start — перезапустить бота и открыть меню\n"
+            "/help — показать эту справку\n\n"
+            "🔑 *Только для тебя:*\n"
+            "/broadcast — рассылка текстового сообщения всем пользователям\n"
+            "/stats — статистика пользователей (всего / активных)\n"
+            "/cancel — отменить рассылку",
+            parse_mode="Markdown",
+        )
+    else:
+        await message.answer(
+            "📋 *Команды бота:*\n\n"
+            "/start — перезапустить бота и открыть меню",
+            parse_mode="Markdown",
+        )
+
+
 @dp.message(Command("stats"))
 async def on_stats(message: Message) -> None:
     """Admin: show user count."""
