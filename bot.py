@@ -400,9 +400,10 @@ def main_keyboard() -> InlineKeyboardMarkup:
 
 def chart_keyboard(src: str, dst: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="📊 График за неделю", callback_data=f"chart:{src}:{dst}"),
-        ]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 График за неделю", callback_data=f"chart:{src}:{dst}")],
+            [InlineKeyboardButton(text="↩️ Главное меню", callback_data="back:menu")],
+        ]
     )
 
 
@@ -542,6 +543,14 @@ async def on_broadcast_message(message: Message, state: FSMContext, bot: Bot) ->
         f"Заблокировали бота: {blocked}\n"
         f"Ошибки: {failed}"
     )
+
+
+@dp.callback_query(F.data == "back:menu")
+async def on_back_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Выбери направление конвертации:", reply_markup=main_keyboard())
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("conv:"))
