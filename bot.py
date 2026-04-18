@@ -11,11 +11,13 @@ import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()
+
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -27,12 +29,12 @@ from aiogram.types import (
     InlineKeyboardMarkup, Message,
 )
 
-BOT_TOKEN: str = os.environ["BOT_TOKEN"]
-DB_PATH = Path(__file__).parent / "rates.db"
 
-# ── Admin settings ─────────────────────────────────────────────────────────────
-# Укажи свой Telegram user_id в файле .env (ADMIN_ID=123456789)
+# ── Config ────────────────────────────────────────────────────────────────────
+
+BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 ADMIN_ID: int = int(os.getenv("ADMIN_ID", "0"))
+DB_PATH = Path(__file__).parent / "rates.db"
 
 CURRENCIES = {
     "btc": ("BTC", "🪙"),
@@ -40,6 +42,7 @@ CURRENCIES = {
     "eur": ("EUR", "💶"),
     "kzt": ("KZT", "🇰🇿"),
 }
+VALID_CODES = {*CURRENCIES, "rub", "usd_d"}
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -67,7 +70,7 @@ def init_db() -> None:
         """)
 
 
-def db_save(date: str, currency: str, rate: float) -> None:
+def db_save_rate(date: str, currency: str, rate: float) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO rates VALUES (?, ?, ?)",
@@ -94,11 +97,20 @@ def db_has_today(currency: str) -> bool:
     return count > 0
 
 
-# ── Users ─────────────────────────────────────────────────────────────────────
+def db_cleanup_old_rates(keep_days: int = 30) -> None:
+    """Удалить записи курсов старше keep_days, чтобы не разрастаться бесконечно."""
+    cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        deleted = conn.execute(
+            "DELETE FROM rates WHERE date < ?", (cutoff,)
+        ).rowcount
+    if deleted:
+        logging.info("Cleanup: removed %d rate records older than %s", deleted, cutoff)
+
 
 def db_register_user(user_id: int, username: str | None,
                      first_name: str | None, last_name: str | None) -> None:
-    """Upsert user record. Updates username/name and last_seen on every call."""
+    """Upsert пользователя + обновление last_seen при каждом сообщении."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -114,36 +126,31 @@ def db_register_user(user_id: int, username: str | None,
 
 
 def db_mark_inactive(user_id: int) -> None:
-    """Called when bot is blocked — mark user as inactive so they skip broadcasts."""
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "UPDATE users SET is_active = 0 WHERE user_id = ?",
-            (user_id,),
-        )
+        conn.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
 
 
 def db_get_active_user_ids() -> list[int]:
-    """Return all user_ids eligible for broadcast."""
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT user_id FROM users WHERE is_active = 1"
-        ).fetchall()
+        rows = conn.execute("SELECT user_id FROM users WHERE is_active = 1").fetchall()
     return [r[0] for r in rows]
 
 
 def db_user_stats() -> tuple[int, int]:
-    """Return (total_users, active_users)."""
+    """(total, active)"""
     with sqlite3.connect(DB_PATH) as conn:
         total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        active = conn.execute(
-            "SELECT COUNT(*) FROM users WHERE is_active = 1"
-        ).fetchone()[0]
+        active = conn.execute("SELECT COUNT(*) FROM users WHERE is_active = 1").fetchone()[0]
     return total, active
 
 
-# ── CBR fetch & save ──────────────────────────────────────────────────────────
+# ── External rate APIs ────────────────────────────────────────────────────────
+
+_btc_price: float | None = None
+
 
 async def fetch_cbr_rates() -> dict[str, float]:
+    """USD и EUR с ЦБ РФ (RUB за 1 единицу)."""
     async with aiohttp.ClientSession() as session:
         async with session.get(
             "https://www.cbr-xml-daily.ru/daily_json.js", timeout=15
@@ -155,84 +162,8 @@ async def fetch_cbr_rates() -> dict[str, float]:
     }
 
 
-def db_cleanup_old_rates(keep_days: int = 30) -> None:
-    """Delete rate records older than keep_days, keeping at most 30 days of history."""
-    cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
-    with sqlite3.connect(DB_PATH) as conn:
-        deleted = conn.execute(
-            "DELETE FROM rates WHERE date < ?", (cutoff,)
-        ).rowcount
-    if deleted:
-        logging.info("Cleanup: removed %d rate records older than %s", deleted, cutoff)
-
-
-async def save_today_cbr_rates() -> dict[str, float]:
-    today = datetime.now().strftime("%Y-%m-%d")
-    rates = await fetch_cbr_rates()
-    for currency, rate in rates.items():
-        db_save(today, currency, rate)
-    db_cleanup_old_rates()
-    logging.info("CBR rates saved for %s: %s", today, rates)
-    return rates
-
-
-async def rate_updater() -> None:
-    """Background task: every hour check if today's CBR rates are saved."""
-    while True:
-        try:
-            if not db_has_today("usd") or not db_has_today("eur"):
-                await save_today_cbr_rates()
-        except Exception:
-            logging.exception("rate_updater: failed to fetch/save CBR rates")
-        await asyncio.sleep(3600)
-
-
-# ── BTC price cache (updated every 10 min) ────────────────────────────────────
-
-_btc_price: float | None = None
-
-
-async def _fetch_btc_price() -> float:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
-            timeout=15,
-        ) as resp:
-            data = await resp.json()
-    return float(data["bitcoin"]["usd"])
-
-
-async def btc_price_updater() -> None:
-    """Background task: refresh BTC/USD price every 10 minutes."""
-    global _btc_price
-    while True:
-        try:
-            _btc_price = await _fetch_btc_price()
-            logging.info("BTC price updated: $%s", _btc_price)
-        except Exception:
-            logging.exception("btc_price_updater: failed")
-        await asyncio.sleep(600)
-
-
-# ── Rates for conversion ──────────────────────────────────────────────────────
-
-async def get_btc_usd_rate() -> float:
-    if _btc_price is not None:
-        return _btc_price
-    return await _fetch_btc_price()
-
-
-async def get_rate_to_rub(currency: str) -> float:
-    if currency == "kzt":
-        return await _fetch_kzt_rate()
-    rates = await fetch_cbr_rates()
-    return rates[currency]
-
-
-# ── KZT — current rate & 7-day history from CBR XML API ──────────────────────
-
-async def _fetch_kzt_rate() -> float:
-    """Current KZT/RUB rate from CBR JSON (per 1 KZT)."""
+async def fetch_kzt_rate() -> float:
+    """Текущий KZT/RUB (RUB за 1 тенге)."""
     async with aiohttp.ClientSession() as session:
         async with session.get(
             "https://www.cbr-xml-daily.ru/daily_json.js", timeout=15
@@ -242,8 +173,8 @@ async def _fetch_kzt_rate() -> float:
     return float(valute["Value"]) / float(valute["Nominal"])
 
 
-async def _fetch_kzt_weekly() -> list[tuple[datetime, float]]:
-    """7-day KZT/RUB history from CBR dynamic XML API (R01335 = KZT, nominal 100)."""
+async def fetch_kzt_weekly() -> list[tuple[datetime, float]]:
+    """7 дней KZT/RUB с XML dynamic API ЦБ (R01335 = KZT)."""
     end = datetime.now()
     start = end - timedelta(days=10)   # запас на выходные
     url = (
@@ -265,29 +196,52 @@ async def _fetch_kzt_weekly() -> list[tuple[datetime, float]]:
     return points[-7:]
 
 
-# ── Historical rates for chart ────────────────────────────────────────────────
+async def fetch_btc_price() -> float:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+            timeout=15,
+        ) as resp:
+            data = await resp.json()
+    return float(data["bitcoin"]["usd"])
+
+
+async def fetch_btc_weekly() -> list[tuple[datetime, float]]:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+            "?vs_currency=usd&days=7&interval=daily",
+            timeout=20,
+        ) as resp:
+            data = await resp.json()
+    points = [(datetime.fromtimestamp(p[0] / 1000), p[1]) for p in data["prices"]]
+    current = _btc_price or (await fetch_btc_price())
+    if points:
+        points[-1] = (points[-1][0], current)
+    return points
+
+
+# ── Rate helpers ──────────────────────────────────────────────────────────────
+
+async def get_btc_usd_rate() -> float:
+    return _btc_price if _btc_price is not None else await fetch_btc_price()
+
+
+async def get_rate_to_rub(currency: str) -> float:
+    if currency == "kzt":
+        return await fetch_kzt_rate()
+    rates = await fetch_cbr_rates()
+    return rates[currency]
+
 
 async def get_weekly_rates(currency: str) -> list[tuple[datetime, float]]:
     if currency == "btc":
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-                "?vs_currency=usd&days=7&interval=daily",
-                timeout=20,
-            ) as resp:
-                data = await resp.json()
-        points = [(datetime.fromtimestamp(p[0] / 1000), p[1]) for p in data["prices"]]
-        current = _btc_price or (await _fetch_btc_price())
-        if points:
-            points[-1] = (points[-1][0], current)
-        return points
-
+        return await fetch_btc_weekly()
     if currency == "kzt":
-        points = await _fetch_kzt_weekly()
+        points = await fetch_kzt_weekly()
         if not points:
             raise ValueError("Не удалось получить историю курса KZT. Попробуй позже.")
         return points
-
     rows = db_get_history(currency)
     if not rows:
         raise ValueError(
@@ -297,14 +251,57 @@ async def get_weekly_rates(currency: str) -> list[tuple[datetime, float]]:
     return rows
 
 
-# ── FSM States ────────────────────────────────────────────────────────────────
+# ── Background tasks ──────────────────────────────────────────────────────────
 
-class ConvertStates(StatesGroup):
-    waiting_amount = State()
+async def save_today_cbr_rates() -> dict[str, float]:
+    today = datetime.now().strftime("%Y-%m-%d")
+    rates = await fetch_cbr_rates()
+    for currency, rate in rates.items():
+        db_save_rate(today, currency, rate)
+    db_cleanup_old_rates()
+    logging.info("CBR rates saved for %s: %s", today, rates)
+    return rates
 
 
-class BroadcastStates(StatesGroup):
-    waiting_message = State()
+async def rate_updater() -> None:
+    """Раз в час проверяем, сохранён ли сегодняшний курс."""
+    while True:
+        try:
+            if not db_has_today("usd") or not db_has_today("eur"):
+                await save_today_cbr_rates()
+        except Exception:
+            logging.exception("rate_updater: failed to fetch/save CBR rates")
+        await asyncio.sleep(3600)
+
+
+async def btc_price_updater() -> None:
+    """Раз в 10 минут обновляем кэш BTC/USD."""
+    global _btc_price
+    while True:
+        try:
+            _btc_price = await fetch_btc_price()
+            logging.info("BTC price updated: $%s", _btc_price)
+        except Exception:
+            logging.exception("btc_price_updater: failed")
+        await asyncio.sleep(600)
+
+
+# ── Formatting ────────────────────────────────────────────────────────────────
+
+def fmt_amount(value: float) -> str:
+    """До 4 знаков после запятой, без научной нотации и хвостовых нулей."""
+    return f"{round(value, 4):.4f}".rstrip("0").rstrip(".")
+
+
+def labels(src: str, dst: str) -> tuple[str, str]:
+    def label(code: str) -> str:
+        if code == "rub":
+            return "₽"
+        if code == "usd_d":
+            return "💵 USD"
+        ticker, emoji = CURRENCIES[code]
+        return f"{emoji} {ticker}"
+    return label(src), label(dst)
 
 
 # ── Chart ─────────────────────────────────────────────────────────────────────
@@ -315,7 +312,6 @@ def build_chart(currency: str, src: str, data: list[tuple[datetime, float]]) -> 
     ticker, _ = CURRENCIES[currency]
     dates = [d[0] for d in data]
     prices = [d[1] for d in data]
-
     is_btc = currency == "btc"
 
     fig, ax = plt.subplots(figsize=(10, 4))
@@ -361,7 +357,7 @@ def build_chart(currency: str, src: str, data: list[tuple[datetime, float]]) -> 
 
     days_shown = len(dates)
     period = f"последние {days_shown} дн." if days_shown < 7 else "последние 7 дней"
-    if currency == "btc":
+    if is_btc:
         direction = "USD -> BTC" if src in ("usd_d", "usd") else "BTC -> USD"
     else:
         direction = f"RUB -> {ticker}" if src == "rub" else f"{ticker} -> RUB"
@@ -399,7 +395,8 @@ def main_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def chart_keyboard(src: str, dst: str) -> InlineKeyboardMarkup:
+def prompt_keyboard(src: str, dst: str) -> InlineKeyboardMarkup:
+    """Клавиатура под приглашением ввести сумму: график + возврат в меню."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 График за неделю", callback_data=f"chart:{src}:{dst}")],
@@ -408,52 +405,47 @@ def chart_keyboard(src: str, dst: str) -> InlineKeyboardMarkup:
     )
 
 
-def _labels(src: str, dst: str) -> tuple[str, str]:
-    def label(code: str) -> str:
-        if code == "rub":
-            return "₽"
-        if code == "usd_d":
-            return "💵 USD"
-        ticker, emoji = CURRENCIES[code]
-        return f"{emoji} {ticker}"
-    return label(src), label(dst)
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="↩️ Главное меню", callback_data="back:menu")]]
+    )
 
 
-# ── Formatting ────────────────────────────────────────────────────────────────
+# ── FSM ───────────────────────────────────────────────────────────────────────
 
-def fmt_amount(value: float) -> str:
-    """Round to max 4 decimal places, no scientific notation, no trailing zeros."""
-    rounded = round(value, 4)
-    return f"{rounded:.4f}".rstrip("0").rstrip(".")
+class ConvertStates(StatesGroup):
+    waiting_amount = State()
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+class BroadcastStates(StatesGroup):
+    waiting_message = State()
 
-VALID_CODES = {*CURRENCIES, "rub", "usd_d"}
 
-
-def _register(message: Message) -> None:
-    """Save/update user from any incoming message."""
+def register_user(message: Message) -> None:
     u = message.from_user
     if u:
         db_register_user(u.id, u.username, u.first_name, u.last_name)
 
 
-# ── Bot handlers ──────────────────────────────────────────────────────────────
+def is_admin(user_id: int) -> bool:
+    return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
 dp = Dispatcher(storage=MemoryStorage())
 
 
 @dp.message(CommandStart())
 async def on_start(message: Message, state: FSMContext) -> None:
-    _register(message)
+    register_user(message)
     await state.clear()
     await message.answer("👋 Привет! Выбери направление конвертации:", reply_markup=main_keyboard())
 
 
 @dp.message(Command("help"))
 async def on_help(message: Message) -> None:
-    if ADMIN_ID and message.from_user.id == ADMIN_ID:
+    if is_admin(message.from_user.id):
         await message.answer(
             "📋 *Доступные команды*\n\n"
             "👤 *Для всех:*\n"
@@ -475,8 +467,7 @@ async def on_help(message: Message) -> None:
 
 @dp.message(Command("stats"))
 async def on_stats(message: Message) -> None:
-    """Admin: show user count."""
-    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     total, active = db_user_stats()
     await message.answer(
@@ -489,8 +480,7 @@ async def on_stats(message: Message) -> None:
 
 @dp.message(Command("broadcast"))
 async def on_broadcast_start(message: Message, state: FSMContext) -> None:
-    """Admin: start broadcast — next message will be sent to all active users."""
-    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     _, active = db_user_stats()
     await state.set_state(BroadcastStates.waiting_message)
@@ -505,17 +495,15 @@ async def on_broadcast_start(message: Message, state: FSMContext) -> None:
 @dp.message(Command("cancel"))
 async def on_cancel(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
+    await state.clear()
     if current == BroadcastStates.waiting_message:
-        await state.clear()
         await message.answer("❌ Рассылка отменена.")
     else:
-        await state.clear()
         await message.answer("Главное меню:", reply_markup=main_keyboard())
 
 
 @dp.message(BroadcastStates.waiting_message)
 async def on_broadcast_message(message: Message, state: FSMContext, bot: Bot) -> None:
-    """Send text message to every active user."""
     if not message.text:
         await message.answer("⚠️ Поддерживается только текст. Введи текстовое сообщение:")
         return
@@ -577,19 +565,19 @@ async def on_direction(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.set_state(ConvertStates.waiting_amount)
-    from_label, to_label = _labels(src, dst)
+    await state.update_data(src=src, dst=dst)
+    from_label, to_label = labels(src, dst)
 
     try:
         await callback.message.delete()
     except Exception:
         pass
 
-    sent = await callback.message.answer(
+    await callback.message.answer(
         f"Введи количество *{from_label}* для конвертации в *{to_label}*:",
         parse_mode="Markdown",
-        reply_markup=chart_keyboard(src, dst),
+        reply_markup=prompt_keyboard(src, dst),
     )
-    await state.update_data(src=src, dst=dst, prompt_msg_id=sent.message_id)
     await callback.answer()
 
 
@@ -612,42 +600,34 @@ async def on_chart(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     ticker, emoji = CURRENCIES[currency]
-    from_label, to_label = _labels(src, dst)
+    from_label, to_label = labels(src, dst)
+    chat_id = callback.message.chat.id
 
     try:
-        await callback.bot.delete_message(
-            chat_id=callback.message.chat.id,
-            message_id=callback.message.message_id,
-        )
+        await callback.bot.delete_message(chat_id=chat_id, message_id=callback.message.message_id)
     except Exception:
         pass
 
     chart_msg = await callback.bot.send_photo(
-        chat_id=callback.message.chat.id,
+        chat_id=chat_id,
         photo=BufferedInputFile(chart_bytes, filename="chart.png"),
         caption=f"📊 *{emoji} {ticker} / ₽* — курс ЦБ РФ",
         parse_mode="Markdown",
     )
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="↩️ Главное меню", callback_data="back:menu")],
-    ])
-    sent = await callback.bot.send_message(
-        chat_id=callback.message.chat.id,
+    await callback.bot.send_message(
+        chat_id=chat_id,
         text=f"Введи количество *{from_label}* для конвертации в *{to_label}*:",
         parse_mode="Markdown",
-        reply_markup=back_kb,
+        reply_markup=back_keyboard(),
     )
-    await state.update_data(prompt_msg_id=sent.message_id, chart_msg_id=chart_msg.message_id)
+    await state.update_data(chart_msg_id=chart_msg.message_id)
 
 
 @dp.message(ConvertStates.waiting_amount)
 async def on_amount(message: Message, state: FSMContext) -> None:
-    _register(message)
+    register_user(message)
 
-    # Принимаем только текстовые сообщения с числом
-    raw = message.text
-    if raw is None:
-        # Пользователь прислал медиа, стикер и т.п.
+    if message.text is None:
         await state.clear()
         await message.answer(
             "⚠️ Неверный формат. Пожалуйста, введи числовое значение.\n\n"
@@ -656,7 +636,7 @@ async def on_amount(message: Message, state: FSMContext) -> None:
         )
         return
 
-    text = raw.replace(",", ".").strip()
+    text = message.text.replace(",", ".").strip()
     try:
         amount = float(text)
         if amount <= 0:
@@ -673,14 +653,14 @@ async def on_amount(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     src, dst = data.get("src"), data.get("dst")
 
-    # BTC ↔ USD pair
+    # BTC ↔ USD
     if "btc" in (src, dst):
         try:
             rate = await get_btc_usd_rate()
         except Exception as e:
             logging.exception("btc rate fetch failed")
-            await message.answer(f"Не удалось получить курс: {e}. Попробуй позже.")
             await state.clear()
+            await message.answer(f"Не удалось получить курс: {e}. Попробуй позже.")
             return
         if src == "btc":
             from_str = f"{fmt_amount(amount)} 🪙 BTC"
@@ -694,6 +674,7 @@ async def on_amount(message: Message, state: FSMContext) -> None:
         await message.answer("🔄 Ещё конвертация?", reply_markup=main_keyboard())
         return
 
+    # USD/EUR/KZT ↔ RUB
     currency = dst if src == "rub" else src
     if currency not in CURRENCIES:
         await state.clear()
@@ -704,19 +685,17 @@ async def on_amount(message: Message, state: FSMContext) -> None:
         rate = await get_rate_to_rub(currency)
     except Exception as e:
         logging.exception("rate fetch failed")
-        await message.answer(f"Не удалось получить курс: {e}. Попробуй позже.")
         await state.clear()
+        await message.answer(f"Не удалось получить курс: {e}. Попробуй позже.")
         return
 
     ticker, emoji = CURRENCIES[currency]
     if src == "rub":
-        result_amount = amount / rate
         from_str = f"{amount:,.2f} ₽".replace(",", " ")
-        to_str = f"{fmt_amount(result_amount)} {emoji} {ticker}"
+        to_str = f"{fmt_amount(amount / rate)} {emoji} {ticker}"
     else:
-        result_amount = amount * rate
         from_str = f"{fmt_amount(amount)} {emoji} {ticker}"
-        to_str = f"{result_amount:,.2f} ₽".replace(",", " ")
+        to_str = f"{amount * rate:,.2f} ₽".replace(",", " ")
 
     rate_str = f"1 {ticker} = {fmt_amount(rate)} ₽"
     await message.answer(f"💱 *{from_str} = {to_str}*\n_{rate_str}_", parse_mode="Markdown")
@@ -727,22 +706,13 @@ async def on_amount(message: Message, state: FSMContext) -> None:
 @dp.message(StateFilter(None))
 async def on_unknown_message(message: Message) -> None:
     """Любое сообщение вне FSM — показываем главное меню."""
-    _register(message)
+    register_user(message)
     await message.answer("Выбери направление конвертации:", reply_markup=main_keyboard())
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    init_db()
-    try:
-        await save_today_cbr_rates()
-    except Exception:
-        logging.exception("Failed to save initial CBR rates")
-    bot = Bot(BOT_TOKEN)
-
-    # ── Bot menu commands ──────────────────────────────────────────────────────
+async def setup_bot_commands(bot: Bot) -> None:
     user_commands = [
         BotCommand(command="start", description="Открыть меню конвертации"),
         BotCommand(command="help",  description="Список команд"),
@@ -755,6 +725,18 @@ async def main() -> None:
     await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
     if ADMIN_ID:
         await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    init_db()
+    try:
+        await save_today_cbr_rates()
+    except Exception:
+        logging.exception("Failed to save initial CBR rates")
+
+    bot = Bot(BOT_TOKEN)
+    await setup_bot_commands(bot)
 
     asyncio.create_task(rate_updater())
     asyncio.create_task(btc_price_updater())
