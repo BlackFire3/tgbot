@@ -154,11 +154,23 @@ async def fetch_cbr_rates() -> dict[str, float]:
     }
 
 
+def db_cleanup_old_rates(keep_days: int = 30) -> None:
+    """Delete rate records older than keep_days, keeping at most 30 days of history."""
+    cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        deleted = conn.execute(
+            "DELETE FROM rates WHERE date < ?", (cutoff,)
+        ).rowcount
+    if deleted:
+        logging.info("Cleanup: removed %d rate records older than %s", deleted, cutoff)
+
+
 async def save_today_cbr_rates() -> dict[str, float]:
     today = datetime.now().strftime("%Y-%m-%d")
     rates = await fetch_cbr_rates()
     for currency, rate in rates.items():
         db_save(today, currency, rate)
+    db_cleanup_old_rates()
     logging.info("CBR rates saved for %s: %s", today, rates)
     return rates
 
