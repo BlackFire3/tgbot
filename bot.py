@@ -607,10 +607,14 @@ async def on_chart(callback: CallbackQuery, state: FSMContext) -> None:
         caption=f"📊 *{emoji} {ticker} / ₽* — курс ЦБ РФ",
         parse_mode="Markdown",
     )
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Главное меню", callback_data="back:menu")],
+    ])
     sent = await callback.bot.send_message(
         chat_id=callback.message.chat.id,
         text=f"Введи количество *{from_label}* для конвертации в *{to_label}*:",
         parse_mode="Markdown",
+        reply_markup=back_kb,
     )
     await state.update_data(prompt_msg_id=sent.message_id)
 
