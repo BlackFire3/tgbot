@@ -1,11 +1,15 @@
 import asyncio
 import io
 import logging
+import os
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiohttp
+from dotenv import load_dotenv
+
+load_dotenv()
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -21,12 +25,12 @@ from aiogram.types import (
     InlineKeyboardMarkup, Message,
 )
 
-BOT_TOKEN = "BOT_TOKEN_HIDDEN"
+BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 DB_PATH = Path(__file__).parent / "rates.db"
 
 # ── Admin settings ─────────────────────────────────────────────────────────────
-# Укажи сюда свой Telegram user_id (получить можно у @userinfobot)
-ADMIN_ID: int = 0  # TODO: замени на свой user_id
+# Укажи свой Telegram user_id в файле .env (ADMIN_ID=123456789)
+ADMIN_ID: int = int(os.getenv("ADMIN_ID", "0"))
 
 CURRENCIES = {
     "btc": ("BTC", "🪙"),
