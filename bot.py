@@ -22,6 +22,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
     BufferedInputFile, CallbackQuery, InlineKeyboardButton,
     InlineKeyboardMarkup, Message,
 )
@@ -740,6 +741,21 @@ async def main() -> None:
     except Exception:
         logging.exception("Failed to save initial CBR rates")
     bot = Bot(BOT_TOKEN)
+
+    # ── Bot menu commands ──────────────────────────────────────────────────────
+    user_commands = [
+        BotCommand(command="start", description="Открыть меню конвертации"),
+        BotCommand(command="help",  description="Список команд"),
+    ]
+    admin_commands = user_commands + [
+        BotCommand(command="broadcast", description="Рассылка сообщения всем пользователям"),
+        BotCommand(command="stats",     description="Статистика пользователей"),
+        BotCommand(command="cancel",    description="Отменить рассылку"),
+    ]
+    await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+    if ADMIN_ID:
+        await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+
     asyncio.create_task(rate_updater())
     asyncio.create_task(btc_price_updater())
     await dp.start_polling(bot)
