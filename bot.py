@@ -506,13 +506,31 @@ async def on_chart(callback: CallbackQuery, state: FSMContext) -> None:
 @dp.message(ConvertStates.waiting_amount)
 async def on_amount(message: Message, state: FSMContext) -> None:
     _register(message)
-    text = (message.text or "").replace(",", ".").strip()
+
+    # Принимаем только текстовые сообщения с числом
+    raw = message.text
+    if raw is None:
+        # Пользователь прислал медиа, стикер и т.п.
+        await state.clear()
+        await message.answer(
+            "⚠️ Неверный формат. Пожалуйста, введи числовое значение.\n\n"
+            "Выбери направление конвертации:",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    text = raw.replace(",", ".").strip()
     try:
         amount = float(text)
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("Нужно число больше нуля. Попробуй ещё раз:")
+        await state.clear()
+        await message.answer(
+            "⚠️ Неверный формат. Пожалуйста, введи числовое значение больше нуля.\n\n"
+            "Выбери направление конвертации:",
+            reply_markup=main_keyboard(),
+        )
         return
 
     data = await state.get_data()
