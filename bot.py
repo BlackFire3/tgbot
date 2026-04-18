@@ -548,7 +548,10 @@ async def on_broadcast_message(message: Message, state: FSMContext, bot: Bot) ->
 @dp.callback_query(F.data == "back:menu")
 async def on_back_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.message.edit_reply_markup(reply_markup=None)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
     await callback.message.answer("Выбери направление конвертации:", reply_markup=main_keyboard())
     await callback.answer()
 
@@ -562,6 +565,11 @@ async def on_direction(callback: CallbackQuery, state: FSMContext) -> None:
 
     await state.set_state(ConvertStates.waiting_amount)
     from_label, to_label = _labels(src, dst)
+
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
 
     sent = await callback.message.answer(
         f"Введи количество *{from_label}* для конвертации в *{to_label}*:",
