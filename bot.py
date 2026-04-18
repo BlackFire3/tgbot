@@ -547,11 +547,23 @@ async def on_broadcast_message(message: Message, state: FSMContext, bot: Bot) ->
 
 @dp.callback_query(F.data == "back:menu")
 async def on_back_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
     await state.clear()
+    # Удаляем сообщение с кнопкой
     try:
         await callback.message.delete()
     except Exception:
         pass
+    # Удаляем график, если он был
+    chart_msg_id = data.get("chart_msg_id")
+    if chart_msg_id:
+        try:
+            await callback.bot.delete_message(
+                chat_id=callback.message.chat.id,
+                message_id=chart_msg_id,
+            )
+        except Exception:
+            pass
     await callback.message.answer("Выбери направление конвертации:", reply_markup=main_keyboard())
     await callback.answer()
 
@@ -609,7 +621,7 @@ async def on_chart(callback: CallbackQuery, state: FSMContext) -> None:
     except Exception:
         pass
 
-    await callback.bot.send_photo(
+    chart_msg = await callback.bot.send_photo(
         chat_id=callback.message.chat.id,
         photo=BufferedInputFile(chart_bytes, filename="chart.png"),
         caption=f"📊 *{emoji} {ticker} / ₽* — курс ЦБ РФ",
@@ -624,7 +636,7 @@ async def on_chart(callback: CallbackQuery, state: FSMContext) -> None:
         parse_mode="Markdown",
         reply_markup=back_kb,
     )
-    await state.update_data(prompt_msg_id=sent.message_id)
+    await state.update_data(prompt_msg_id=sent.message_id, chart_msg_id=chart_msg.message_id)
 
 
 @dp.message(ConvertStates.waiting_amount)
