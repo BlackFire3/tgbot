@@ -1,0 +1,436 @@
+import asyncio
+import io
+import logging
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import aiohttp
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.ticker import FuncFormatter
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BufferedInputFile, CallbackQuery, InlineKeyboardButton,
+    InlineKeyboardMarkup, Message,
+)
+
+BOT_TOKEN = "BOT_TOKEN_HIDDEN"
+DB_PATH = Path(__file__).parent / "rates.db"
+
+CURRENCIES = {
+    "btc": ("BTC", "🪙"),
+    "usd": ("USD", "💵"),
+    "eur": ("EUR", "💶"),
+}
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS rates (
+                date     TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                rate     REAL NOT NULL,
+                PRIMARY KEY (date, currency)
+            )
+        """)
+
+
+def db_save(date: str, currency: str, rate: float) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO rates VALUES (?, ?, ?)",
+            (date, currency, rate),
+        )
+
+
+def db_get_history(currency: str, days: int = 8) -> list[tuple[datetime, float]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT date, rate FROM rates WHERE currency = ? ORDER BY date ASC",
+            (currency,),
+        ).fetchall()
+    return [(datetime.strptime(r[0], "%Y-%m-%d"), r[1]) for r in rows[-days:]]
+
+
+def db_has_today(currency: str) -> bool:
+    today = datetime.now().strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM rates WHERE date = ? AND currency = ?",
+            (today, currency),
+        ).fetchone()[0]
+    return count > 0
+
+
+# ── CBR fetch & save ──────────────────────────────────────────────────────────
+
+async def fetch_cbr_rates() -> dict[str, float]:
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=15) as resp:
+            data = await resp.json(content_type=None)
+    return {
+        "usd": float(data["Valute"]["USD"]["Value"]),
+        "eur": float(data["Valute"]["EUR"]["Value"]),
+    }
+
+
+async def save_today_cbr_rates() -> dict[str, float]:
+    today = datetime.now().strftime("%Y-%m-%d")
+    rates = await fetch_cbr_rates()
+    for currency, rate in rates.items():
+        db_save(today, currency, rate)
+    logging.info("CBR rates saved for %s: %s", today, rates)
+    return rates
+
+
+async def rate_updater() -> None:
+    """Background task: every hour check if today's CBR rates are saved."""
+    while True:
+        try:
+            if not db_has_today("usd") or not db_has_today("eur"):
+                await save_today_cbr_rates()
+        except Exception:
+            logging.exception("rate_updater: failed to fetch/save CBR rates")
+        await asyncio.sleep(3600)
+
+
+# ── BTC price cache (updated every 10 min) ────────────────────────────────────
+
+_btc_price: float | None = None
+
+
+async def _fetch_btc_price() -> float:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+            timeout=15,
+        ) as resp:
+            data = await resp.json()
+    return float(data["bitcoin"]["usd"])
+
+
+async def btc_price_updater() -> None:
+    """Background task: refresh BTC/USD price every 10 minutes."""
+    global _btc_price
+    while True:
+        try:
+            _btc_price = await _fetch_btc_price()
+            logging.info("BTC price updated: $%s", _btc_price)
+        except Exception:
+            logging.exception("btc_price_updater: failed")
+        await asyncio.sleep(600)
+
+
+# ── Rates for conversion ──────────────────────────────────────────────────────
+
+async def get_btc_usd_rate() -> float:
+    if _btc_price is not None:
+        return _btc_price
+    return await _fetch_btc_price()
+
+
+async def get_rate_to_rub(currency: str) -> float:
+    rates = await fetch_cbr_rates()
+    return rates[currency]
+
+
+# ── Historical rates for chart ────────────────────────────────────────────────
+
+async def get_weekly_rates(currency: str) -> list[tuple[datetime, float]]:
+    if currency == "btc":
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+                "?vs_currency=usd&days=7&interval=daily",
+                timeout=20,
+            ) as resp:
+                data = await resp.json()
+        points = [(datetime.fromtimestamp(p[0] / 1000), p[1]) for p in data["prices"]]
+        # Replace last point with cached price so chart matches conversion rate
+        current = _btc_price or (await _fetch_btc_price())
+        if points:
+            points[-1] = (points[-1][0], current)
+        return points
+
+    rows = db_get_history(currency)
+    if not rows:
+        raise ValueError(
+            "История курсов ЦБ ещё не накоплена.\n"
+            "Данные начнут собираться с сегодняшнего дня — попробуй завтра."
+        )
+    return rows
+
+
+class ConvertStates(StatesGroup):
+    waiting_amount = State()
+
+
+# ── Chart ─────────────────────────────────────────────────────────────────────
+
+def build_chart(currency: str, src: str, data: list[tuple[datetime, float]]) -> bytes:
+    if not data:
+        raise ValueError("Нет данных для построения графика")
+    ticker, _ = CURRENCIES[currency]
+    dates = [d[0] for d in data]
+    prices = [d[1] for d in data]
+
+    is_btc = currency == "btc"
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    fig.patch.set_facecolor("#1a1a2e")
+    ax.set_facecolor("#16213e")
+
+    color = "#f7931a" if is_btc else "#4cc9f0"
+    ax.plot(dates, prices, color=color, linewidth=2.5, zorder=3)
+    ax.fill_between(dates, prices, min(prices) * 0.998, alpha=0.25, color=color)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+    ax.tick_params(colors="#e0e0e0", labelsize=10)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#2d2d5e")
+    ax.grid(True, color="#2d2d5e", linestyle="--", alpha=0.6, zorder=0)
+
+    if is_btc:
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
+        y_label = "Цена (USD)"
+        last_label = f"${prices[-1]:,.0f}"
+    else:
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:,.2f} ₽"))
+        y_label = "Курс ЦБ РФ (₽)"
+        last_label = f"{prices[-1]:,.2f} ₽"
+
+    ax.scatter([dates[-1]], [prices[-1]], color=color, s=60, zorder=5)
+    ax.annotate(
+        last_label,
+        xy=(dates[-1], prices[-1]),
+        xytext=(0, 10),
+        textcoords="offset points",
+        ha="center",
+        fontsize=10,
+        fontweight="bold",
+        color="#ffffff",
+        bbox=dict(boxstyle="round,pad=0.3", fc="#1a1a2e", ec=color, lw=1.2),
+        zorder=6,
+    )
+
+    days_shown = len(dates)
+    period = f"последние {days_shown} дн." if days_shown < 7 else "последние 7 дней"
+    if currency == "btc":
+        direction = "USD -> BTC" if src in ("usd_d", "usd") else "BTC -> USD"
+    else:
+        direction = f"RUB -> {ticker}" if src == "rub" else f"{ticker} -> RUB"
+    ax.set_title(f"{direction}  |  {period}", color="#e0e0e0", fontsize=13, pad=10)
+    ax.set_ylabel(y_label, color="#a0a0c0", fontsize=10)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+# ── Bot handlers ──────────────────────────────────────────────────────────────
+
+dp = Dispatcher(storage=MemoryStorage())
+
+
+@dp.message(CommandStart())
+async def on_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("👋 Привет! Выбери направление конвертации:", reply_markup=main_keyboard())
+
+
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🪙 BTC → $", callback_data="conv:btc:usd_d"),
+                InlineKeyboardButton(text="💵 USD → ₽", callback_data="conv:usd:rub"),
+                InlineKeyboardButton(text="💶 EUR → ₽", callback_data="conv:eur:rub"),
+            ],
+            [
+                InlineKeyboardButton(text="$ → 🪙 BTC", callback_data="conv:usd_d:btc"),
+                InlineKeyboardButton(text="₽ → 💵 USD", callback_data="conv:rub:usd"),
+                InlineKeyboardButton(text="₽ → 💶 EUR", callback_data="conv:rub:eur"),
+            ],
+        ]
+    )
+
+
+def chart_keyboard(src: str, dst: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="📊 График за неделю", callback_data=f"chart:{src}:{dst}"),
+        ]]
+    )
+
+
+def _labels(src: str, dst: str) -> tuple[str, str]:
+    def label(code: str) -> str:
+        if code == "rub":
+            return "₽"
+        if code == "usd_d":
+            return "💵 USD"
+        ticker, emoji = CURRENCIES[code]
+        return f"{emoji} {ticker}"
+    return label(src), label(dst)
+
+
+VALID_CODES = {*CURRENCIES, "rub", "usd_d"}
+
+
+@dp.callback_query(F.data.startswith("conv:"))
+async def on_direction(callback: CallbackQuery, state: FSMContext) -> None:
+    _, src, dst = callback.data.split(":")
+    if src not in VALID_CODES or dst not in VALID_CODES:
+        await callback.answer("Неизвестная валюта")
+        return
+
+    await state.set_state(ConvertStates.waiting_amount)
+    from_label, to_label = _labels(src, dst)
+
+    sent = await callback.message.answer(
+        f"Введи количество *{from_label}* для конвертации в *{to_label}*:",
+        parse_mode="Markdown",
+        reply_markup=chart_keyboard(src, dst),
+    )
+    await state.update_data(src=src, dst=dst, prompt_msg_id=sent.message_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("chart:"))
+async def on_chart(callback: CallbackQuery, state: FSMContext) -> None:
+    _, src, dst = callback.data.split(":")
+    currency = "btc" if "btc" in (src, dst) else (dst if src == "rub" else src)
+    if currency not in CURRENCIES:
+        await callback.answer("Неизвестная валюта")
+        return
+
+    await callback.answer("⏳ Загружаю график...")
+
+    try:
+        weekly = await get_weekly_rates(currency)
+        chart_bytes = build_chart(currency, src, weekly)
+    except Exception as e:
+        logging.exception("chart build failed")
+        await callback.message.answer(f"Не удалось построить график: {e}")
+        return
+
+    ticker, emoji = CURRENCIES[currency]
+    from_label, to_label = _labels(src, dst)
+
+    try:
+        await callback.bot.delete_message(
+            chat_id=callback.message.chat.id,
+            message_id=callback.message.message_id,
+        )
+    except Exception:
+        pass
+
+    await callback.bot.send_photo(
+        chat_id=callback.message.chat.id,
+        photo=BufferedInputFile(chart_bytes, filename="chart.png"),
+        caption=f"📊 *{emoji} {ticker} / ₽* — курс ЦБ РФ",
+        parse_mode="Markdown",
+    )
+    sent = await callback.bot.send_message(
+        chat_id=callback.message.chat.id,
+        text=f"Введи количество *{from_label}* для конвертации в *{to_label}*:",
+        parse_mode="Markdown",
+    )
+    await state.update_data(prompt_msg_id=sent.message_id)
+
+
+@dp.message(ConvertStates.waiting_amount)
+async def on_amount(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").replace(",", ".").strip()
+    try:
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Нужно число больше нуля. Попробуй ещё раз:")
+        return
+
+    data = await state.get_data()
+    src, dst = data.get("src"), data.get("dst")
+
+    # BTC ↔ USD pair
+    if "btc" in (src, dst):
+        try:
+            rate = await get_btc_usd_rate()
+        except Exception as e:
+            logging.exception("btc rate fetch failed")
+            await message.answer(f"Не удалось получить курс: {e}. Попробуй позже.")
+            await state.clear()
+            return
+        if src == "btc":
+            from_str = f"{amount:g} 🪙 BTC"
+            to_str = f"${amount * rate:,.2f}".replace(",", " ")
+        else:
+            from_str = f"${amount:,.2f}".replace(",", " ")
+            to_str = f"{amount / rate:g} 🪙 BTC"
+        rate_str = f"1 BTC = ${rate:,.2f}".replace(",", " ")
+        await message.answer(f"💱 *{from_str} = {to_str}*\n_{rate_str}_", parse_mode="Markdown")
+        await state.clear()
+        await message.answer("🔄 Ещё конвертация?", reply_markup=main_keyboard())
+        return
+
+    currency = dst if src == "rub" else src
+    if currency not in CURRENCIES:
+        await state.clear()
+        await message.answer("Сессия сброшена. Нажми /start", reply_markup=main_keyboard())
+        return
+
+    try:
+        rate = await get_rate_to_rub(currency)
+    except Exception as e:
+        logging.exception("rate fetch failed")
+        await message.answer(f"Не удалось получить курс: {e}. Попробуй позже.")
+        await state.clear()
+        return
+
+    ticker, emoji = CURRENCIES[currency]
+    if src == "rub":
+        result_amount = amount / rate
+        from_str = f"{amount:,.2f} ₽".replace(",", " ")
+        to_str = f"{result_amount:g} {emoji} {ticker}"
+    else:
+        result_amount = amount * rate
+        from_str = f"{amount:g} {emoji} {ticker}"
+        to_str = f"{result_amount:,.2f} ₽".replace(",", " ")
+
+    rate_str = f"1 {ticker} = {rate:,.2f} ₽".replace(",", " ")
+    await message.answer(f"💱 *{from_str} = {to_str}*\n_{rate_str}_", parse_mode="Markdown")
+    await state.clear()
+    await message.answer("🔄 Ещё конвертация?", reply_markup=main_keyboard())
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    init_db()
+    try:
+        await save_today_cbr_rates()
+    except Exception:
+        logging.exception("Failed to save initial CBR rates")
+    bot = Bot(BOT_TOKEN)
+    asyncio.create_task(rate_updater())
+    asyncio.create_task(btc_price_updater())
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
