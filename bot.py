@@ -420,13 +420,37 @@ def fmt_delta_line(currency: str) -> str:
 
 # ── Chart ─────────────────────────────────────────────────────────────────────
 
-def build_chart(currency: str, src: str, data: list[tuple[datetime, float]]) -> bytes:
+def build_chart(currency: str, src: str, dst: str, data: list[tuple[datetime, float]]) -> bytes:
+    """Строит график курса src → dst за ~7 дней.
+
+    Источник данных `data` хранится в каноническом направлении:
+      - для btc: USD за 1 BTC
+      - для fiat: RUB за 1 currency
+    Если конверсия пользователя идёт в обратную сторону (RUB → X, USD → BTC),
+    значения инвертируются, чтобы последняя точка на графике численно
+    совпадала с «1 src = X dst» из ответа конверсии.
+    """
     if not data:
         raise ValueError("Нет данных для построения графика")
-    ticker, _ = CURRENCIES[currency]
-    dates = [d[0] for d in data]
-    prices = [d[1] for d in data]
     is_btc = currency == "btc"
+    ticker, _ = CURRENCIES[currency]
+    src_ticker = CURRENCIES[src][0]
+    dst_ticker = CURRENCIES[dst][0]
+
+    # Прямая пара — одна из сторон RUB (для fiat) или {btc,usd} (для BTC):
+    # тогда график можно развернуть в сторону, которую выбрал пользователь.
+    direct_fiat = not is_btc and (src == "rub" or dst == "rub")
+    direct_btc = is_btc and {src, dst} <= {"btc", "usd"}
+    is_direct = direct_fiat or direct_btc
+
+    if is_direct:
+        inverted = (src == "usd") if is_btc else (src == "rub")
+    else:
+        inverted = False  # для кросс-пар (usd↔eur и т.п.) показываем src→RUB как есть
+
+    dates = [d[0] for d in data]
+    prices_raw = [d[1] for d in data]
+    prices = [1 / p if p > 0 else 0 for p in prices_raw] if inverted else prices_raw
 
     fig, ax = plt.subplots(figsize=(10, 4))
     fig.patch.set_facecolor("#1a1a2e")
@@ -442,23 +466,38 @@ def build_chart(currency: str, src: str, data: list[tuple[datetime, float]]) -> 
         spine.set_edgecolor("#2d2d5e")
     ax.grid(True, color="#2d2d5e", linestyle="--", alpha=0.6, zorder=0)
 
-    if is_btc:
+    # Формат Y-оси и подписи последней точки — под выбранное направление
+    last_val = prices[-1]
+    if is_btc and not inverted:         # BTC → USD
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
-        y_label = "Цена (USD)"
-        last_label = f"${prices[-1]:,.0f}"
-    elif currency == "kzt":
+        y_label = "USD за 1 🪙 BTC"
+        last_label = f"${last_val:,.0f}"
+    elif is_btc and inverted:           # USD → BTC
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.6f}"))
+        y_label = "🪙 BTC за $1"
+        last_label = f"{last_val:.6f} 🪙 BTC"
+    elif currency == "kzt" and not inverted:   # KZT → RUB
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.4f} ₽"))
-        y_label = "Курс ЦБ РФ (₽)"
-        last_label = f"{prices[-1]:.4f} ₽"
-    else:
+        y_label = "₽ за 1 🇰🇿 KZT"
+        last_label = f"{last_val:.4f} ₽"
+    elif currency == "kzt" and inverted:       # RUB → KZT
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.2f}"))
+        y_label = "🇰🇿 KZT за 1 ₽"
+        last_label = f"{last_val:.2f} 🇰🇿 KZT"
+    elif not inverted:                          # USD/EUR → RUB или кросс (src→RUB)
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:,.2f} ₽"))
-        y_label = "Курс ЦБ РФ (₽)"
-        last_label = f"{prices[-1]:,.2f} ₽"
+        y_label = f"₽ за 1 {ticker}"
+        last_label = f"{last_val:,.2f} ₽"
+    else:                                       # RUB → USD / RUB → EUR
+        prefix = "$" if currency == "usd" else "€"
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.4f}"))
+        y_label = f"{ticker} за 1 ₽"
+        last_label = f"{prefix}{last_val:.4f}"
 
-    ax.scatter([dates[-1]], [prices[-1]], color=color, s=60, zorder=5)
+    ax.scatter([dates[-1]], [last_val], color=color, s=60, zorder=5)
     ax.annotate(
         last_label,
-        xy=(dates[-1], prices[-1]),
+        xy=(dates[-1], last_val),
         xytext=(0, 10),
         textcoords="offset points",
         ha="center",
@@ -471,10 +510,11 @@ def build_chart(currency: str, src: str, data: list[tuple[datetime, float]]) -> 
 
     days_shown = len(dates)
     period = f"последние {days_shown} дн." if days_shown < 7 else "последние 7 дней"
-    if is_btc:
-        direction = "USD -> BTC" if src == "usd" else "BTC -> USD"
+    if is_direct:
+        direction = f"{src_ticker} → {dst_ticker}"
     else:
-        direction = f"RUB -> {ticker}" if src == "rub" else f"{ticker} -> RUB"
+        # Кросс: честно указываем, что на графике src к RUB
+        direction = f"{src_ticker} → RUB (курс ЦБ)"
     ax.set_title(f"{direction}  |  {period}", color="#e0e0e0", fontsize=13, pad=10)
     ax.set_ylabel(y_label, color="#a0a0c0", fontsize=10)
 
@@ -764,13 +804,12 @@ async def on_chart(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer("⏳ Загружаю график...")
     try:
         weekly = await get_weekly_rates(currency)
-        chart_bytes = build_chart(currency, src, weekly)
+        chart_bytes = build_chart(currency, src, dst, weekly)
     except Exception as e:
         logging.exception("chart build failed")
         await callback.message.answer(f"Не удалось построить график: {e}")
         return
 
-    ticker, emoji = CURRENCIES[currency]
     chat_id = callback.message.chat.id
     try:
         await callback.bot.delete_message(chat_id=chat_id, message_id=callback.message.message_id)
@@ -779,7 +818,7 @@ async def on_chart(callback: CallbackQuery, state: FSMContext) -> None:
     chart_msg = await callback.bot.send_photo(
         chat_id=chat_id,
         photo=BufferedInputFile(chart_bytes, filename="chart.png"),
-        caption=f"📊 *{emoji} {ticker}* — 7 дней",
+        caption=f"📊 *{fmt_label(src)} → {fmt_label(dst)}* — 7 дней",
         parse_mode="Markdown",
     )
     await callback.bot.send_message(
