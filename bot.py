@@ -1,6 +1,9 @@
+import ast
 import asyncio
 import io
 import logging
+import math
+import operator
 import os
 import re
 import sqlite3
@@ -511,6 +514,76 @@ async def btc_price_updater(bot: Bot) -> None:
         await asyncio.sleep(600)
 
 
+# ── Safe expression evaluator ─────────────────────────────────────────────────
+
+_SAFE_BINOPS = {
+    ast.Add:      operator.add,
+    ast.Sub:      operator.sub,
+    ast.Mult:     operator.mul,
+    ast.Div:      operator.truediv,
+    ast.Mod:      operator.mod,
+    ast.Pow:      operator.pow,
+    ast.FloorDiv: operator.floordiv,
+}
+_SAFE_UNARYOPS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+_EXPR_MAX_LEN = 128
+_EXPR_OP_RE = re.compile(r"[+\-*/%()]")
+
+
+def safe_eval_expr(expr: str) -> float:
+    """Безопасно вычисляет арифметическое выражение.
+    Поддерживает: + - * / % ** // скобки, целые и дробные числа.
+    Никакого eval() — AST белого списка узлов."""
+    if not expr:
+        raise ValueError("empty expression")
+    if len(expr) > _EXPR_MAX_LEN:
+        raise ValueError("expression too long")
+    # запятая как десятичный разделитель + убираем неразрывные пробелы
+    expr = expr.replace(",", ".").replace("\u00a0", " ")
+    tree = ast.parse(expr, mode="eval")
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+                raise ValueError("only numeric constants allowed")
+            return node.value
+        if isinstance(node, ast.BinOp):
+            op = _SAFE_BINOPS.get(type(node.op))
+            if op is None:
+                raise ValueError(f"binop not allowed: {type(node.op).__name__}")
+            return op(_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp):
+            op = _SAFE_UNARYOPS.get(type(node.op))
+            if op is None:
+                raise ValueError(f"unary not allowed: {type(node.op).__name__}")
+            return op(_eval(node.operand))
+        raise ValueError(f"node not allowed: {type(node).__name__}")
+
+    result = _eval(tree)
+    if isinstance(result, bool) or not isinstance(result, (int, float)):
+        raise ValueError("result is not a number")
+    result = float(result)
+    if not math.isfinite(result):
+        raise ValueError("result is not finite")
+    return result
+
+
+def is_expression(s: str) -> bool:
+    """True если строка содержит арифметический оператор или скобки."""
+    return bool(_EXPR_OP_RE.search(s))
+
+
+def prettify_expr(s: str) -> str:
+    """Косметика для отображения: * → ×, / → ÷, нормализация пробелов."""
+    s = s.replace("*", " × ").replace("/", " ÷ ")
+    return " ".join(s.split())
+
+
 # ── Formatting ────────────────────────────────────────────────────────────────
 
 def fmt_amount(value: float) -> str:
@@ -862,7 +935,9 @@ async def on_help(message: Message) -> None:
             "/broadcast — рассылка текстового сообщения всем пользователям\n"
             "/stats — статистика пользователей (всего / активных)\n"
             "/cancel — отменить рассылку\n\n"
-            "💡 *Inline-режим:* в любом чате наберите `@currencycheckertest123_bot <сумма> <валюта> [целевая]` Если целевая не указана — подставляется rub (для BTC — usd).",
+            "💡 *Inline-режим:* в любом чате наберите `@currencycheckertest123_bot <сумма или выражение> <валюта> [целевая]`. "
+            "Поддерживаются арифметические выражения: `+ - * / % ( )`, например `@currencycheckertest123_bot 2500*12 usd rub`. "
+            "Если целевая не указана — подставляется rub (для BTC — usd).",
             parse_mode="Markdown",
         )
     else:
@@ -870,7 +945,9 @@ async def on_help(message: Message) -> None:
             "📋 *Команды бота:*\n\n"
             "/start — перезапустить бота и открыть меню\n"
             "/alerts — уведомления, когда курс пересечёт заданный порог\n\n"
-            "💡 *Inline-режим:* в любом чате наберите `@currencycheckertest123_bot <сумма> <валюта> [целевая]` Если целевая не указана — подставляется rub (для BTC — usd).",
+            "💡 *Inline-режим:* в любом чате наберите `@currencycheckertest123_bot <сумма или выражение> <валюта> [целевая]`. "
+            "Поддерживаются арифметические выражения: `+ - * / % ( )`, например `@currencycheckertest123_bot 2500*12 usd rub`. "
+            "Если целевая не указана — подставляется rub (для BTC — usd).",
             parse_mode="Markdown",
         )
 
@@ -1075,16 +1152,22 @@ async def on_amount(message: Message, state: FSMContext) -> None:
         )
         return
 
-    text = message.text.replace(",", ".").replace(" ", "").strip()
+    raw_expr = message.text.strip()
+    # для вычисления убираем любые пробелы, запятые как десятичный разделитель
+    # обрабатывает сама safe_eval_expr
+    expr_clean = raw_expr.replace(" ", "")
     try:
-        amount = float(text)
+        amount = safe_eval_expr(expr_clean)
         if amount <= 0:
-            raise ValueError
-    except ValueError:
+            raise ValueError("non-positive")
+    except Exception:
         await state.clear()
         await message.answer(
-            "⚠️ Неверный формат. Пожалуйста, введи числовое значение больше нуля.\n\n"
+            "⚠️ Неверный формат. Введи число или арифметическое выражение "
+            "больше нуля.\n"
+            "_Примеры: `100`, `2500*12`, `(100+50)/3`_\n\n"
             "Выбери направление конвертации:",
+            parse_mode="Markdown",
             reply_markup=main_keyboard(),
         )
         return
@@ -1111,9 +1194,12 @@ async def on_amount(message: Message, state: FSMContext) -> None:
     # Δ за сутки показываем для «основной» валюты пары (не рублёвой стороны)
     delta = fmt_delta_line(src if src != "rub" else dst)
     source = fmt_source_line(src, dst)
+    expr_line = ""
+    if is_expression(expr_clean):
+        expr_line = f"\n_🧮 {prettify_expr(raw_expr)} = {fmt_amount(amount)}_"
 
     await message.answer(
-        f"💱 *{from_str} = {to_str}*\n_{rate_str}_{delta}{source}",
+        f"💱 *{from_str} = {to_str}*{expr_line}\n_{rate_str}_{delta}{source}",
         parse_mode="Markdown",
     )
     await state.clear()
@@ -1353,25 +1439,30 @@ async def on_unknown_message(message: Message) -> None:
 # ── Inline mode ───────────────────────────────────────────────────────────────
 
 INLINE_RE = re.compile(
-    r"^\s*([\d][\d\s.,]*)\s*(btc|usd|eur|kzt|rub|₽|\$|€)\s*(?:to|в|->|→|-)?\s*"
+    # Выражение может содержать цифры, пробелы, `.,` и арифметические знаки `+ - * / % ( )`.
+    # Разделитель `to|в|->|→` — но не `-`, чтобы не конфликтовать с вычитанием.
+    r"^\s*([\d().][\d\s.,+\-*/%()]*?)\s*(btc|usd|eur|kzt|rub|₽|\$|€)"
+    r"\s*(?:to|в|->|→)?\s*"
     r"(btc|usd|eur|kzt|rub|₽|\$|€)?\s*$",
     re.IGNORECASE,
 )
 SYMBOL_MAP = {"₽": "rub", "$": "usd", "€": "eur"}
 
 
-def parse_inline_query(q: str) -> tuple[float, str, str] | None:
+def parse_inline_query(q: str) -> tuple[float, str, str, str] | None:
+    """Разбирает inline-запрос. Возвращает (amount, src, dst, raw_expr) или None.
+    raw_expr — исходное выражение (без префикса суммы), для красивого рендера в ответе."""
     if not q:
         return None
     m = INLINE_RE.match(q)
     if not m:
         return None
-    raw_num = m.group(1).replace(" ", "").replace(",", ".")
+    raw_expr = m.group(1).strip()
     try:
-        amount = float(raw_num)
-        if amount <= 0:
-            return None
-    except ValueError:
+        amount = safe_eval_expr(raw_expr.replace(" ", ""))
+    except Exception:
+        return None
+    if amount <= 0:
         return None
 
     def normalize(s: str) -> str:
@@ -1382,7 +1473,7 @@ def parse_inline_query(q: str) -> tuple[float, str, str] | None:
     dst = normalize(m.group(3)) if m.group(3) else ("usd" if src == "btc" else "rub")
     if src not in VALID_CODES or dst not in VALID_CODES or src == dst:
         return None
-    return amount, src, dst
+    return amount, src, dst, raw_expr
 
 
 @dp.inline_query()
@@ -1392,16 +1483,19 @@ async def on_inline(query: InlineQuery) -> None:
         hint = InlineQueryResultArticle(
             id="hint",
             title="Введи сумму и валюту",
-            description="Примеры: 100 usd • 50 eur rub • 0.1 btc • 1000 kzt usd",
+            description="Примеры: 100 usd • 50 eur rub • (100+50)*2 usd • 2500*12 usd rub",
             input_message_content=InputTextMessageContent(
-                message_text="Формат: `<сумма> <валюта> [целевая]`\nПример: `100 usd rub`",
+                message_text=(
+                    "Формат: `<сумма или выражение> <валюта> [целевая]`\n"
+                    "Примеры: `100 usd rub`, `2500*12 usd`, `(100+50)/3 eur rub`"
+                ),
                 parse_mode="Markdown",
             ),
         )
         await query.answer(results=[hint], cache_time=5, is_personal=True)
         return
 
-    amount, src, dst = parsed
+    amount, src, dst, raw_expr = parsed
     try:
         result = await convert(amount, src, dst)
     except Exception:
@@ -1423,13 +1517,21 @@ async def on_inline(query: InlineQuery) -> None:
     rate_str = f"1 {CURRENCIES[src][0]} = {fmt_currency(per_unit, dst)}"
     delta = fmt_delta_line(src if src != "rub" else dst)
     source = fmt_source_line(src, dst)
+    expr_line = ""
+    if is_expression(raw_expr):
+        expr_line = f"\n_🧮 {prettify_expr(raw_expr)} = {fmt_amount(amount)}_"
+
+    description = (
+        f"🧮 {prettify_expr(raw_expr)} = {fmt_amount(amount)} · {rate_str}"
+        if is_expression(raw_expr) else rate_str
+    )
 
     article = InlineQueryResultArticle(
         id=f"{src}-{dst}-{amount}",
         title=f"{from_str} = {to_str}",
-        description=rate_str,
+        description=description,
         input_message_content=InputTextMessageContent(
-            message_text=f"💱 *{from_str} = {to_str}*\n_{rate_str}_{delta}{source}",
+            message_text=f"💱 *{from_str} = {to_str}*{expr_line}\n_{rate_str}_{delta}{source}",
             parse_mode="Markdown",
         ),
     )
