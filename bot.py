@@ -249,20 +249,51 @@ async def convert(amount: float, src: str, dst: str) -> float:
     return amount * src_rub / dst_rub
 
 
+def _apply_live_last_point(
+    points: list[tuple[datetime, float]], live_rate: float, max_days: int = 7
+) -> list[tuple[datetime, float]]:
+    """Гарантирует, что последняя точка графика = текущему live-курсу (который видит конверсия).
+    Если последняя точка уже за сегодня — перезаписываем значение,
+    иначе добавляем новую точку на сегодня и подрезаем до max_days.
+    """
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if points and points[-1][0].date() == today.date():
+        points[-1] = (points[-1][0], live_rate)
+    else:
+        points.append((today, live_rate))
+        points = points[-max_days:]
+    return points
+
+
 async def get_weekly_rates(currency: str) -> list[tuple[datetime, float]]:
     if currency == "btc":
+        # fetch_btc_weekly сама подменяет последнюю точку на live-цену
         return await fetch_btc_weekly()
+
     if currency == "kzt":
         points = await fetch_kzt_weekly()
         if not points:
             raise ValueError("Не удалось получить историю курса KZT. Попробуй позже.")
+        try:
+            live = await fetch_kzt_rate()
+            points = _apply_live_last_point(points, live)
+        except Exception:
+            logging.exception("failed to refresh live KZT rate for chart")
         return points
+
+    # usd / eur — история в SQLite, текущий курс из CBR JSON
     rows = db_get_history(currency)
     if not rows:
         raise ValueError(
             "История курсов ЦБ ещё не накоплена.\n"
             "Данные начнут собираться с сегодняшнего дня — попробуй завтра."
         )
+    try:
+        live = (await fetch_cbr_rates()).get(currency)
+        if live is not None:
+            rows = _apply_live_last_point(rows, live)
+    except Exception:
+        logging.exception("failed to refresh live CBR rate for chart")
     return rows
 
 
@@ -559,14 +590,14 @@ async def on_help(message: Message) -> None:
             "/broadcast — рассылка текстового сообщения всем пользователям\n"
             "/stats — статистика пользователей (всего / активных)\n"
             "/cancel — отменить рассылку\n\n"
-            "💡 *Inline-режим:* в любом чате набери `@имя_бота 100 usd rub`",
+            "💡 *Inline-режим:* в любом чате наберите `@currencycheckertest123_bot <сумма> <валюта> [целевая]` Если целевая не указана — подставляется rub (для BTC — usd).",
             parse_mode="Markdown",
         )
     else:
         await message.answer(
             "📋 *Команды бота:*\n\n"
             "/start — перезапустить бота и открыть меню\n\n"
-            "💡 *Inline-режим:* в любом чате набери `@имя_бота 100 usd rub`",
+            "💡 *Inline-режим:* в любом чате наберите `@currencycheckertest123_bot <сумма> <валюта> [целевая]` Если целевая не указана — подставляется rub (для BTC — usd).",
             parse_mode="Markdown",
         )
 
