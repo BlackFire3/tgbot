@@ -390,8 +390,9 @@ async def btc_price_updater() -> None:
 # ── Formatting ────────────────────────────────────────────────────────────────
 
 def fmt_amount(value: float) -> str:
-    """До 4 знаков после запятой, без научной нотации и хвостовых нулей."""
-    return f"{round(value, 4):.4f}".rstrip("0").rstrip(".")
+    """До 4 знаков после запятой, без научной нотации и хвостовых нулей,
+    с пробелами между разрядами для целой части."""
+    return f"{round(value, 4):,.4f}".rstrip("0").rstrip(".").replace(",", " ")
 
 
 def fmt_currency(amount: float, code: str) -> str:
@@ -459,11 +460,11 @@ def fmt_delta_line(currency: str) -> str:
     abs_d, pct = d
     arrow = "▲" if abs_d > 0 else ("▼" if abs_d < 0 else "•")
     if currency == "btc":
-        val = f"{abs_d:+,.0f}".replace(",", " ") + " $"
+        val = f"{abs_d:+,.0f} $".replace(",", " ")
     elif currency == "kzt":
-        val = f"{abs_d:+.4f} ₽"
+        val = f"{abs_d:+,.4f} ₽".replace(",", " ")
     else:
-        val = f"{abs_d:+.2f} ₽"
+        val = f"{abs_d:+,.2f} ₽".replace(",", " ")
     return f"\n_{arrow} {val} ({pct:+.2f}%) за сутки_"
 
 
@@ -518,9 +519,9 @@ def build_chart(currency: str, src: str, dst: str, data: list[tuple[datetime, fl
     # Формат Y-оси и подписи последней точки — под выбранное направление
     last_val = prices[-1]
     if is_btc and not inverted:         # BTC → USD
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}".replace(",", " ")))
         y_label = "USD за 1 🪙 BTC"
-        last_label = f"${last_val:,.0f}"
+        last_label = f"${last_val:,.0f}".replace(",", " ")
     elif is_btc and inverted:           # USD → BTC
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.6f}"))
         y_label = "🪙 BTC за $1"
@@ -534,9 +535,9 @@ def build_chart(currency: str, src: str, dst: str, data: list[tuple[datetime, fl
         y_label = "🇰🇿 KZT за 1 ₽"
         last_label = f"{last_val:.2f} 🇰🇿 KZT"
     elif not inverted:                          # USD/EUR → RUB или кросс (src→RUB)
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:,.2f} ₽"))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:,.2f} ₽".replace(",", " ")))
         y_label = f"₽ за 1 {ticker}"
-        last_label = f"{last_val:,.2f} ₽"
+        last_label = f"{last_val:,.2f} ₽".replace(",", " ")
     else:                                       # RUB → USD / RUB → EUR
         prefix = "$" if currency == "usd" else "€"
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.4f}"))
