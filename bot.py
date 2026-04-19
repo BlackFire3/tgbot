@@ -5,7 +5,7 @@ import os
 import re
 import sqlite3
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -149,6 +149,20 @@ def db_user_stats() -> tuple[int, int]:
 # ── External rate APIs ────────────────────────────────────────────────────────
 
 _btc_price: float | None = None
+_btc_fetched_at: datetime | None = None          # когда CoinGecko последний раз отвечал
+_cbr_data_date: datetime | None = None           # Date из ответа ЦБ (дата публикации курса)
+
+
+def _update_cbr_date(data: dict) -> None:
+    """Сохраняем дату публикации курса ЦБ из поля Date в JSON-ответе."""
+    global _cbr_data_date
+    raw = data.get("Date")
+    if not raw:
+        return
+    try:
+        _cbr_data_date = datetime.fromisoformat(raw)
+    except ValueError:
+        pass
 
 
 async def fetch_cbr_rates() -> dict[str, float]:
@@ -157,6 +171,7 @@ async def fetch_cbr_rates() -> dict[str, float]:
             "https://www.cbr-xml-daily.ru/daily_json.js", timeout=15
         ) as resp:
             data = await resp.json(content_type=None)
+    _update_cbr_date(data)
     return {
         "usd": float(data["Valute"]["USD"]["Value"]),
         "eur": float(data["Valute"]["EUR"]["Value"]),
@@ -169,6 +184,7 @@ async def fetch_kzt_rate() -> float:
             "https://www.cbr-xml-daily.ru/daily_json.js", timeout=15
         ) as resp:
             data = await resp.json(content_type=None)
+    _update_cbr_date(data)
     valute = data["Valute"]["KZT"]
     return float(valute["Value"]) / float(valute["Nominal"])
 
@@ -196,12 +212,14 @@ async def fetch_kzt_weekly() -> list[tuple[datetime, float]]:
 
 
 async def fetch_btc_price() -> float:
+    global _btc_fetched_at
     async with aiohttp.ClientSession() as session:
         async with session.get(
             "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
             timeout=15,
         ) as resp:
             data = await resp.json()
+    _btc_fetched_at = datetime.now(timezone.utc)
     return float(data["bitcoin"]["usd"])
 
 
@@ -398,6 +416,37 @@ def fmt_currency(amount: float, code: str) -> str:
 def fmt_label(code: str) -> str:
     ticker, emoji = CURRENCIES[code]
     return f"{emoji} {ticker}"
+
+
+def _humanize_ago(ts: datetime) -> str:
+    now = datetime.now(ts.tzinfo) if ts.tzinfo else datetime.now()
+    seconds = int((now - ts).total_seconds())
+    if seconds < 60:
+        return "только что"
+    if seconds < 3600:
+        return f"{seconds // 60} мин назад"
+    if seconds < 86400:
+        return f"{seconds // 3600} ч назад"
+    return f"{seconds // 86400} дн назад"
+
+
+def fmt_source_line(src: str, dst: str) -> str:
+    """Откуда взят курс + когда он был опубликован / получен."""
+    if src == dst:
+        return ""
+    pair = {src, dst}
+    parts: list[str] = []
+    if "btc" in pair:
+        when = f" ({_humanize_ago(_btc_fetched_at)})" if _btc_fetched_at else ""
+        parts.append(f"CoinGecko{when}")
+    # BTC↔USD — чистый CG, ЦБ не задействован. Во всех остальных парах
+    # с любой не-BTC валютой мы ходим в ЦБ (напрямую или как пивот к рублю).
+    if pair != {"btc", "usd"}:
+        when = f" (курс на {_cbr_data_date.strftime('%d.%m.%Y')})" if _cbr_data_date else ""
+        parts.append(f"ЦБ РФ{when}")
+    if not parts:
+        return ""
+    return "\n_📡 Источник: " + " · ".join(parts) + "_"
 
 
 def fmt_delta_line(currency: str) -> str:
@@ -877,9 +926,10 @@ async def on_amount(message: Message, state: FSMContext) -> None:
     rate_str = f"1 {CURRENCIES[src][0]} = {fmt_currency(per_unit, dst)}"
     # Δ за сутки показываем для «основной» валюты пары (не рублёвой стороны)
     delta = fmt_delta_line(src if src != "rub" else dst)
+    source = fmt_source_line(src, dst)
 
     await message.answer(
-        f"💱 *{from_str} = {to_str}*\n_{rate_str}_{delta}",
+        f"💱 *{from_str} = {to_str}*\n_{rate_str}_{delta}{source}",
         parse_mode="Markdown",
     )
     await state.clear()
@@ -965,13 +1015,14 @@ async def on_inline(query: InlineQuery) -> None:
     per_unit = result / amount
     rate_str = f"1 {CURRENCIES[src][0]} = {fmt_currency(per_unit, dst)}"
     delta = fmt_delta_line(src if src != "rub" else dst)
+    source = fmt_source_line(src, dst)
 
     article = InlineQueryResultArticle(
         id=f"{src}-{dst}-{amount}",
         title=f"{from_str} = {to_str}",
         description=rate_str,
         input_message_content=InputTextMessageContent(
-            message_text=f"💱 *{from_str} = {to_str}*\n_{rate_str}_{delta}",
+            message_text=f"💱 *{from_str} = {to_str}*\n_{rate_str}_{delta}{source}",
             parse_mode="Markdown",
         ),
     )
