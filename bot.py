@@ -48,6 +48,10 @@ CURRENCIES = {
 }
 VALID_CODES = set(CURRENCIES)
 
+# Алерты: для каких валют и сколько максимум на пользователя.
+ALERT_CURRENCIES: tuple[str, ...] = ("btc", "usd", "eur", "kzt")
+MAX_ALERTS_PER_USER = 10
+
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -72,6 +76,18 @@ def init_db() -> None:
                 is_active  INTEGER NOT NULL DEFAULT 1
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                currency   TEXT    NOT NULL,
+                op         TEXT    NOT NULL,
+                threshold  REAL    NOT NULL,
+                created_at TEXT    NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_currency ON alerts(currency)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user     ON alerts(user_id)")
 
 
 def db_save_rate(date: str, currency: str, rate: float) -> None:
@@ -144,6 +160,57 @@ def db_user_stats() -> tuple[int, int]:
         total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         active = conn.execute("SELECT COUNT(*) FROM users WHERE is_active = 1").fetchone()[0]
     return total, active
+
+
+def db_count_alerts(user_id: int) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM alerts WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+
+
+def db_create_alert(user_id: int, currency: str, op: str, threshold: float) -> int:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "INSERT INTO alerts (user_id, currency, op, threshold, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, currency, op, threshold, now),
+        )
+        return cur.lastrowid
+
+
+def db_list_alerts(user_id: int) -> list[tuple[int, str, str, float, str]]:
+    """Все алерты юзера: (id, currency, op, threshold, created_at)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT id, currency, op, threshold, created_at FROM alerts "
+            "WHERE user_id = ? ORDER BY id ASC",
+            (user_id,),
+        ).fetchall()
+
+
+def db_alerts_by_currency(currency: str) -> list[tuple[int, int, str, float]]:
+    """Все активные алерты по валюте: (id, user_id, op, threshold)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT id, user_id, op, threshold FROM alerts WHERE currency = ?",
+            (currency,),
+        ).fetchall()
+
+
+def db_delete_alert(alert_id: int, user_id: int) -> bool:
+    """Удаляет алерт только если он принадлежит указанному юзеру."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "DELETE FROM alerts WHERE id = ? AND user_id = ?",
+            (alert_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def db_delete_alert_by_id(alert_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
 
 
 # ── External rate APIs ────────────────────────────────────────────────────────
@@ -258,6 +325,14 @@ async def get_rub_rate(currency: str) -> float:
     return rates[currency]
 
 
+async def get_alert_rate(currency: str) -> float:
+    """Базовая рыночная ставка для алертов:
+    BTC → цена в USD, usd/eur/kzt → курс в RUB."""
+    if currency == "btc":
+        return await get_btc_usd_rate()
+    return await get_rub_rate(currency)
+
+
 async def convert(amount: float, src: str, dst: str) -> float:
     """Универсальная конверсия через RUB как промежуточную."""
     if src == dst:
@@ -364,10 +439,58 @@ async def save_today_rates() -> None:
     logging.info("Daily rates saved for %s", today)
 
 
-async def rate_updater() -> None:
-    """Раз в час добираем пропущенные сегодняшние записи."""
+async def _fire_alert(
+    bot: Bot, user_id: int, currency: str, op: str, threshold: float, rate: float
+) -> None:
+    tkr, emj = CURRENCIES[currency]
+    arrow = "▲" if op == ">" else "▼"
+    direction = "выше" if op == ">" else "ниже"
+    try:
+        await bot.send_message(
+            user_id,
+            f"🔔 *Сработал алерт!*\n\n"
+            f"{emj} *{tkr}* сейчас *{fmt_alert_value(currency, rate)}* "
+            f"— условие «{arrow} {direction} {fmt_alert_value(currency, threshold)}» выполнено.\n\n"
+            f"_Алерт одноразовый и удалён. Создать новый — /alerts_",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        err = str(e).lower()
+        if "blocked" in err or "deactivated" in err or "not found" in err:
+            db_mark_inactive(user_id)
+        raise
+
+
+async def check_alerts(bot: Bot, currency: str, rate: float) -> None:
+    """Проверяет все алерты по валюте и шлёт уведомления тем, у кого условие выполнено.
+    Сработавшие удаляются (one-shot)."""
+    rows = db_alerts_by_currency(currency)
+    for alert_id, user_id, op, threshold in rows:
+        triggered = (op == ">" and rate > threshold) or (op == "<" and rate < threshold)
+        if not triggered:
+            continue
+        db_delete_alert_by_id(alert_id)
+        try:
+            await _fire_alert(bot, user_id, currency, op, threshold, rate)
+        except Exception:
+            logging.exception("alert fire failed (user=%s, id=%s)", user_id, alert_id)
+
+
+async def rate_updater(bot: Bot) -> None:
+    """Раз в час: сверяем фиатные курсы (для алертов) и добираем пропущенные записи в SQLite."""
     while True:
         try:
+            try:
+                rates = await fetch_cbr_rates()
+                for cur, r in rates.items():
+                    await check_alerts(bot, cur, r)
+            except Exception:
+                logging.exception("rate_updater: CBR fetch/alerts failed")
+            try:
+                kzt = await fetch_kzt_rate()
+                await check_alerts(bot, "kzt", kzt)
+            except Exception:
+                logging.exception("rate_updater: KZT fetch/alerts failed")
             if not all(db_has_today(c) for c in ("usd", "eur", "kzt", "btc")):
                 await save_today_rates()
         except Exception:
@@ -375,13 +498,14 @@ async def rate_updater() -> None:
         await asyncio.sleep(3600)
 
 
-async def btc_price_updater() -> None:
-    """Раз в 10 минут обновляем кэш BTC/USD."""
+async def btc_price_updater(bot: Bot) -> None:
+    """Раз в 10 минут обновляем кэш BTC/USD и проверяем алерты по BTC."""
     global _btc_price
     while True:
         try:
             _btc_price = await fetch_btc_price()
             logging.info("BTC price updated: $%s", _btc_price)
+            await check_alerts(bot, "btc", _btc_price)
         except Exception:
             logging.exception("btc_price_updater failed")
         await asyncio.sleep(600)
@@ -417,6 +541,13 @@ def fmt_currency(amount: float, code: str) -> str:
 def fmt_label(code: str) -> str:
     ticker, emoji = CURRENCIES[code]
     return f"{emoji} {ticker}"
+
+
+def fmt_alert_value(currency: str, value: float) -> str:
+    """Форматирует порог/текущий курс в базовой валюте алерта:
+    BTC → в USD, остальные → в RUB."""
+    base = "usd" if currency == "btc" else "rub"
+    return fmt_currency(value, base)
 
 
 def _humanize_ago(ts: datetime) -> str:
@@ -595,7 +726,53 @@ def main_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="₽ → 🇰🇿 KZT", callback_data="conv:rub:kzt"),
             InlineKeyboardButton(text="🌍 Другая пара", callback_data="pick:from"),
         ],
+        [
+            InlineKeyboardButton(text="🔔 Алерты по курсу", callback_data="alert:menu"),
+        ],
     ])
+
+
+def alerts_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📋 Мои алерты", callback_data="alert:list"),
+            InlineKeyboardButton(text="➕ Добавить",   callback_data="alert:add"),
+        ],
+        [InlineKeyboardButton(text="↩️ Главное меню", callback_data="back:menu")],
+    ])
+
+
+def alert_pick_currency_keyboard() -> InlineKeyboardMarkup:
+    rows = _grid_buttons(list(ALERT_CURRENCIES), "alert_cur", per_row=4)
+    rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data="alert:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def alert_pick_op_keyboard(cur: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="▲ Выше порога", callback_data=f"alert_op:{cur}:gt"),
+            InlineKeyboardButton(text="▼ Ниже порога", callback_data=f"alert_op:{cur}:lt"),
+        ],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="alert:add")],
+    ])
+
+
+def alerts_list_keyboard(alerts: list[tuple[int, str, str, float, str]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for alert_id, currency, op, threshold, _ in alerts:
+        tkr, emj = CURRENCIES[currency]
+        arrow = "▲" if op == ">" else "▼"
+        thr_str = fmt_alert_value(currency, threshold)
+        rows.append([InlineKeyboardButton(
+            text=f"❌ {emj} {tkr} {arrow} {thr_str}",
+            callback_data=f"alert_del:{alert_id}",
+        )])
+    rows.append([
+        InlineKeyboardButton(text="➕ Добавить",     callback_data="alert:add"),
+        InlineKeyboardButton(text="↩️ Главное меню", callback_data="back:menu"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _grid_buttons(codes: list[str], prefix: str, per_row: int = 3) -> list[list[InlineKeyboardButton]]:
@@ -646,6 +823,10 @@ class BroadcastStates(StatesGroup):
     waiting_message = State()
 
 
+class AlertStates(StatesGroup):
+    waiting_threshold = State()
+
+
 def register_user(message: Message) -> None:
     u = message.from_user
     if u:
@@ -675,6 +856,7 @@ async def on_help(message: Message) -> None:
             "📋 *Доступные команды*\n\n"
             "👤 *Для всех:*\n"
             "/start — перезапустить бота и открыть меню\n"
+            "/alerts — уведомления, когда курс пересечёт заданный порог\n"
             "/help — показать эту справку\n\n"
             "🔑 *Только для тебя:*\n"
             "/broadcast — рассылка текстового сообщения всем пользователям\n"
@@ -686,7 +868,8 @@ async def on_help(message: Message) -> None:
     else:
         await message.answer(
             "📋 *Команды бота:*\n\n"
-            "/start — перезапустить бота и открыть меню\n\n"
+            "/start — перезапустить бота и открыть меню\n"
+            "/alerts — уведомления, когда курс пересечёт заданный порог\n\n"
             "💡 *Inline-режим:* в любом чате наберите `@currencycheckertest123_bot <сумма> <валюта> [целевая]` Если целевая не указана — подставляется rub (для BTC — usd).",
             parse_mode="Markdown",
         )
@@ -937,6 +1120,229 @@ async def on_amount(message: Message, state: FSMContext) -> None:
     await message.answer("🔄 Ещё конвертация?", reply_markup=main_keyboard())
 
 
+# ── Alerts: handlers ──────────────────────────────────────────────────────────
+
+async def _send_alerts_menu(target: Message, user_id: int) -> None:
+    count = db_count_alerts(user_id)
+    await target.answer(
+        "🔔 *Алерты по курсу*\n\n"
+        "Уведомлю, как только курс пересечёт заданный порог.\n"
+        f"Активно: *{count}* / {MAX_ALERTS_PER_USER}\n\n"
+        "_Поддерживаются: BTC (в USD), USD / EUR / KZT (в RUB).\n"
+        "Алерты одноразовые — после срабатывания удаляются._",
+        parse_mode="Markdown",
+        reply_markup=alerts_menu_keyboard(),
+    )
+
+
+@dp.message(Command("alerts"))
+async def on_alerts_cmd(message: Message, state: FSMContext) -> None:
+    register_user(message)
+    await state.clear()
+    await _send_alerts_menu(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == "alert:menu")
+async def on_alert_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await _send_alerts_menu(callback.message, callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "alert:add")
+async def on_alert_add(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if db_count_alerts(callback.from_user.id) >= MAX_ALERTS_PER_USER:
+        await callback.answer(
+            f"Достигнут лимит в {MAX_ALERTS_PER_USER} алертов. Удали лишние.",
+            show_alert=True,
+        )
+        return
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.message.answer(
+        "Выбери валюту для алерта:",
+        reply_markup=alert_pick_currency_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("alert_cur:"))
+async def on_alert_pick_cur(callback: CallbackQuery, state: FSMContext) -> None:
+    _, cur = callback.data.split(":")
+    if cur not in ALERT_CURRENCIES:
+        await callback.answer("Неизвестная валюта")
+        return
+    await state.update_data(alert_cur=cur)
+    tkr, emj = CURRENCIES[cur]
+    hint = ""
+    try:
+        rate = await get_alert_rate(cur)
+        hint = f"\nТекущий курс: *{fmt_alert_value(cur, rate)}*"
+    except Exception:
+        logging.exception("alert: failed to fetch hint rate for %s", cur)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.message.answer(
+        f"Валюта: *{emj} {tkr}*{hint}\n\nКогда уведомить?",
+        parse_mode="Markdown",
+        reply_markup=alert_pick_op_keyboard(cur),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("alert_op:"))
+async def on_alert_pick_op(callback: CallbackQuery, state: FSMContext) -> None:
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректно")
+        return
+    _, cur, op_code = parts
+    if cur not in ALERT_CURRENCIES or op_code not in ("gt", "lt"):
+        await callback.answer("Некорректно")
+        return
+    op = ">" if op_code == "gt" else "<"
+    await state.set_state(AlertStates.waiting_threshold)
+    await state.update_data(alert_cur=cur, alert_op=op)
+    unit = "$" if cur == "btc" else "₽"
+    hint = ""
+    try:
+        rate = await get_alert_rate(cur)
+        hint = f"\n_Текущий курс: {fmt_alert_value(cur, rate)}_"
+    except Exception:
+        logging.exception("alert: failed to fetch hint rate for %s", cur)
+    tkr, emj = CURRENCIES[cur]
+    direction = "выше" if op == ">" else "ниже"
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.message.answer(
+        f"Условие: *{emj} {tkr}* {direction} порога.\n"
+        f"Введи пороговое значение в *{unit}*:{hint}",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.message(AlertStates.waiting_threshold)
+async def on_alert_threshold(message: Message, state: FSMContext) -> None:
+    register_user(message)
+    if not message.text:
+        await message.answer("⚠️ Нужно прислать число.")
+        return
+    text = (
+        message.text.replace(",", ".").replace(" ", "")
+        .replace("$", "").replace("€", "").replace("₽", "").strip()
+    )
+    try:
+        threshold = float(text)
+        if threshold <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("⚠️ Введи положительное число, например: `95.5` или `100000`",
+                             parse_mode="Markdown")
+        return
+
+    data = await state.get_data()
+    cur, op = data.get("alert_cur"), data.get("alert_op")
+    if cur not in ALERT_CURRENCIES or op not in (">", "<"):
+        await state.clear()
+        await message.answer("Сессия сброшена. Нажми /alerts", reply_markup=main_keyboard())
+        return
+
+    if db_count_alerts(message.from_user.id) >= MAX_ALERTS_PER_USER:
+        await state.clear()
+        await message.answer(
+            f"Достигнут лимит в {MAX_ALERTS_PER_USER} алертов. Удали лишние.",
+            reply_markup=alerts_menu_keyboard(),
+        )
+        return
+
+    # Если условие уже выполнено — создавать бессмысленно (мгновенно сработает).
+    try:
+        current = await get_alert_rate(cur)
+    except Exception:
+        current = None
+    if current is not None and (
+        (op == ">" and current > threshold) or (op == "<" and current < threshold)
+    ):
+        await state.clear()
+        await message.answer(
+            f"⚠️ Условие уже выполнено: текущий курс *{fmt_alert_value(cur, current)}* "
+            f"{op} *{fmt_alert_value(cur, threshold)}*.\n"
+            f"Алерт не создан — выбери другой порог.",
+            parse_mode="Markdown",
+            reply_markup=alerts_menu_keyboard(),
+        )
+        return
+
+    db_create_alert(message.from_user.id, cur, op, threshold)
+    await state.clear()
+    tkr, emj = CURRENCIES[cur]
+    direction = "выше" if op == ">" else "ниже"
+    await message.answer(
+        f"✅ Алерт создан: {emj} *{tkr}* {direction} *{fmt_alert_value(cur, threshold)}*.\n"
+        f"_Пришлю уведомление, как только курс пересечёт этот порог._",
+        parse_mode="Markdown",
+        reply_markup=alerts_menu_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "alert:list")
+async def on_alert_list(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    alerts = db_list_alerts(callback.from_user.id)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    if not alerts:
+        await callback.message.answer(
+            "📋 У тебя пока нет алертов.\n\nНажми «➕ Добавить», чтобы создать первый.",
+            reply_markup=alerts_menu_keyboard(),
+        )
+    else:
+        await callback.message.answer(
+            "📋 *Твои алерты*\nНажми на алерт, чтобы удалить:",
+            parse_mode="Markdown",
+            reply_markup=alerts_list_keyboard(alerts),
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("alert_del:"))
+async def on_alert_del(callback: CallbackQuery, state: FSMContext) -> None:
+    _, aid_raw = callback.data.split(":")
+    try:
+        aid = int(aid_raw)
+    except ValueError:
+        await callback.answer("Некорректно")
+        return
+    ok = db_delete_alert(aid, callback.from_user.id)
+    await callback.answer("Удалено" if ok else "Не найдено")
+    alerts = db_list_alerts(callback.from_user.id)
+    try:
+        if not alerts:
+            await callback.message.edit_text(
+                "📋 У тебя пока нет алертов.\n\nНажми «➕ Добавить», чтобы создать первый.",
+                reply_markup=alerts_menu_keyboard(),
+            )
+        else:
+            await callback.message.edit_reply_markup(reply_markup=alerts_list_keyboard(alerts))
+    except Exception:
+        logging.exception("alert: failed to refresh list after delete")
+
+
 @dp.message(StateFilter(None))
 async def on_unknown_message(message: Message) -> None:
     """Любое сообщение вне FSM — показываем главное меню."""
@@ -1034,8 +1440,9 @@ async def on_inline(query: InlineQuery) -> None:
 
 async def setup_bot_commands(bot: Bot) -> None:
     user_commands = [
-        BotCommand(command="start", description="Открыть меню конвертации"),
-        BotCommand(command="help",  description="Список команд"),
+        BotCommand(command="start",  description="Открыть меню конвертации"),
+        BotCommand(command="alerts", description="Уведомления о курсах"),
+        BotCommand(command="help",   description="Список команд"),
     ]
     admin_commands = user_commands + [
         BotCommand(command="broadcast", description="Рассылка сообщения всем пользователям"),
@@ -1058,8 +1465,8 @@ async def main() -> None:
     bot = Bot(BOT_TOKEN)
     await setup_bot_commands(bot)
 
-    asyncio.create_task(rate_updater())
-    asyncio.create_task(btc_price_updater())
+    asyncio.create_task(rate_updater(bot))
+    asyncio.create_task(btc_price_updater(bot))
     await dp.start_polling(bot)
 
 
