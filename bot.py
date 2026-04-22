@@ -724,20 +724,20 @@ def build_chart(currency: str, src: str, dst: str, data: list[tuple[datetime, fl
     last_val = prices[-1]
     if is_btc and not inverted:         # BTC → USD
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}".replace(",", " ")))
-        y_label = "USD за 1 🪙 BTC"
+        y_label = "USD за 1 BTC"
         last_label = f"${last_val:,.0f}".replace(",", " ")
     elif is_btc and inverted:           # USD → BTC
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.6f}"))
-        y_label = "🪙 BTC за $1"
-        last_label = f"{last_val:.6f} 🪙 BTC"
+        y_label = "BTC за $1"
+        last_label = f"{last_val:.6f} BTC"
     elif currency == "kzt" and not inverted:   # KZT → RUB
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.4f} ₽"))
-        y_label = "₽ за 1 🇰🇿 KZT"
+        y_label = "₽ за 1 KZT"
         last_label = f"{last_val:.4f} ₽"
     elif currency == "kzt" and inverted:       # RUB → KZT
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.2f}"))
-        y_label = "🇰🇿 KZT за 1 ₽"
-        last_label = f"{last_val:.2f} 🇰🇿 KZT"
+        y_label = "KZT за 1 ₽"
+        last_label = f"{last_val:.2f} KZT"
     elif not inverted:                          # USD/EUR → RUB или кросс (src→RUB)
         ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:,.2f} ₽".replace(",", " ")))
         y_label = f"₽ за 1 {ticker}"
@@ -935,8 +935,8 @@ async def on_help(message: Message) -> None:
             "/broadcast — рассылка текстового сообщения всем пользователям\n"
             "/stats — статистика пользователей (всего / активных)\n"
             "/cancel — отменить рассылку\n\n"
-            "💡 *Inline-режим:* в любом чате наберите `@currencycheckertest123_bot <сумма или выражение> <валюта> [целевая]`. Если целевая не указана — подставляется rub (для BTC — usd).\n"
-            "Поддерживаются арифметические выражения: `+ - * / % ( )`, например `@currencycheckertest123_bot 2500*12 usd rub`.",
+            "💡 *Inline-режим:* в любом чате наберите `@currencycheckertest123_bot <сумма или выражение> <валюта> [целевая]`, например `@currencycheckertest123_bot 2500*12 usd rub`.. Если целевая не указана — подставляется rub (для BTC — usd).\n"
+            "Поддерживаются арифметические выражения: `+ - * / % ( )`.",
             parse_mode="Markdown",
         )
     else:
@@ -1126,7 +1126,7 @@ async def on_chart(callback: CallbackQuery, state: FSMContext) -> None:
     chart_msg = await callback.bot.send_photo(
         chat_id=chat_id,
         photo=BufferedInputFile(chart_bytes, filename="chart.png"),
-        caption=f"📊 *{fmt_label(src)} → {fmt_label(dst)}* — 7 дней",
+        caption=f"*{fmt_label(src)} → {fmt_label(dst)}* — 7 дней",
         parse_mode="Markdown",
     )
     await callback.bot.send_message(
